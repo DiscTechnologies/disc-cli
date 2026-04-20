@@ -1,140 +1,154 @@
-# disc-cli
+# Disc CLI
 
-Native Rust CLI for Disc signal discovery and live signal consumption.
+Native Rust CLI for **Disc** – discover signals and consume live data streams.
 
-The current v1 scope is aligned with the live Disc signal stack:
+---
 
-- HTTP discovery via `api.disc.tech`
-- WebSocket subscriptions via `signals.disc.tech`
-- API-key authentication via `X-Disc-Api-Key`
-- MessagePack websocket protocol compatible with the current Disc signals services
-
-## Build
+## Quick start (30 seconds)
 
 ```bash
-cargo build
+brew install disctechnologies/tap/disc
+
+# set your API key once
+disc auth api-key set
+
+# stream a signal
+disc signals passive subscribe <passive-signal-id> --format ndjson
 ```
 
-Run directly during development:
+---
+
+## What it does
+
+- 🔍 Discover passive and active signals
+- 📡 Subscribe to live signal streams (WebSocket)
+- 🔐 Authenticate via API key (`X-Disc-Api-Key`)
+- ⚡ Stream data to stdout (pipe-friendly)
+
+Backed by:
+- HTTP: `api.disc.tech`
+- WS: `signals.disc.tech` (MessagePack protocol)
+
+---
+
+## Installation
+
+### Homebrew (recommended)
 
 ```bash
-cargo run --bin disc -- --help
+brew tap disctech/tap
+brew install disc
 ```
 
-Use the thin local-stack wrapper:
+Verify:
 
 ```bash
-./disc.sh auth whoami
+disc --version
 ```
 
-The wrapper pins local defaults:
+---
 
-- HTTP: `http://localhost:3001`
-- WS: `ws://localhost:8097`
-- client id: `disc-cli-local`
+## Authentication
 
-If `DISC_LOCAL_API_KEY` is set, the wrapper injects it automatically. If it is not set, it falls back to `DISC_API_KEY`, and otherwise uses whatever auth state the CLI resolves on its own.
-
-## Auth
-
-Store an API key locally:
+Set your API key (stored locally):
 
 ```bash
-cargo run --bin disc -- auth api-key set
+disc auth api-key set
 ```
 
-Or pass it per-command:
+Or pass per command:
 
 ```bash
-DISC_API_KEY=... cargo run --bin disc -- auth whoami
+DISC_API_KEY=... disc auth whoami
 ```
 
-Validate the configured credential:
+Check current auth:
 
 ```bash
-cargo run --bin disc -- auth whoami
+disc auth whoami
 ```
 
-## Signal discovery
+---
 
-List passive signals:
+## Discover signals
+
+### Passive signals
 
 ```bash
-cargo run --bin disc -- signals passive list
+disc signals passive list
+disc signals passive get <passive-signal-id>
 ```
 
-Get one passive signal:
+### Active signals
 
 ```bash
-cargo run --bin disc -- signals passive get <passive-signal-id>
+disc signals active list --for-passive <passive-signal-id>
+disc signals active get <active-signal-id>
 ```
 
-List active signals for a passive signal:
+---
+
+## Stream live data
+
+### Subscribe (machine-friendly)
+
+Streams events to stdout (best for piping):
 
 ```bash
-cargo run --bin disc -- signals active list --for-passive <passive-signal-id>
+disc signals passive subscribe <passive-signal-id> --format ndjson
 ```
 
-Get one active signal:
+Pipe to another process:
 
 ```bash
-cargo run --bin disc -- signals active get <active-signal-id>
+disc signals passive subscribe <passive-signal-id> --format ndjson | jq
 ```
 
-## Live streaming
-
-`subscribe` is the machine-oriented path:
-
-- silently maintains the websocket subscription
-- forwards matched events to a destination
-- defaults to `ndjson`
-
-`tail` is the human-oriented path:
-
-- pretty-prints live events to the console
-- includes subscription lifecycle output by default
-
-Subscribe to one passive signal and forward to stdout:
+Write to file:
 
 ```bash
-cargo run --bin disc -- signals passive subscribe <passive-signal-id>
+disc signals passive subscribe <passive-signal-id> \
+  --format ndjson \
+  --destination ./output.ndjson
 ```
 
-Subscribe with backfill and append to a file:
+With backfill:
 
 ```bash
-cargo run --bin disc -- signals passive subscribe <passive-signal-id> \
+disc signals passive subscribe <passive-signal-id> \
   --backfill \
   --backfill-count 5 \
-  --include-status \
-  --format ndjson \
-  --destination ./passive-signal.ndjson
+  --format ndjson
 ```
 
-Tail one active signal in the console:
+---
+
+### Tail (human-friendly)
+
+Pretty console output:
 
 ```bash
-cargo run --bin disc -- signals active tail <active-signal-id> \
-  --window-semantics ordinal \
-  --format pretty
+disc signals active tail <active-signal-id> --format pretty
 ```
 
-Interactive subscription manager:
+---
+
+### Interactive mode
 
 ```bash
-cargo run --bin disc -- signals subscribe
+disc signals subscribe
 ```
 
-That opens a persistent prompt where you can:
+- toggle passive signals
+- explore active signals
+- manage live subscriptions
+- stream to file
 
-- toggle passive signal subscriptions
-- pick a passive signal and expand its active signals
-- toggle active signal subscriptions
-- keep subscriptions running and write them to the chosen destination file
+---
 
 ## Runtime options
 
-Supported stream options:
+### Streaming
 
 - `--window-semantics elapsed|ordinal`
 - `--backfill`
@@ -146,102 +160,101 @@ Supported stream options:
 - `--timeout <duration>`
 - `--no-reconnect`
 
-Supported output modes:
+### Output formats
 
 - `pretty`
 - `json`
-- `ndjson`
+- `ndjson` (recommended for pipelines)
 
-Supported output filters:
+### Output filters
 
 - `data`
 - `status`
 - `events`
 - `all`
 
-## Local config
+---
 
-The CLI stores config/auth in platform-standard config directories:
+## Configuration
+
+Stored in platform-standard locations:
 
 - macOS: `~/Library/Application Support/disc/`
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/disc/`
 - Windows: `%APPDATA%/disc/`
 
-Tracked files are:
+Files:
 
 - `config.json`
 - `auth.json`
 
-The API key is never written into repository files.
+🔐 API keys are stored locally and never committed to the repo.
 
-## Homebrew release flow
+---
 
-`disc-cli` is packaged for Homebrew as prebuilt release archives, not source builds on the user machine.
+## Development
 
-Release archives contain only:
+Build locally:
 
-- `disc`
-- `README.md`
-- `LICENSE`
+```bash
+cargo build
+```
 
-Release automation lives in `.github/workflows/release.yml` and currently targets:
+Run:
 
-- `aarch64-apple-darwin` on `macos-14`
-- `x86_64-apple-darwin` on `macos-13`
-- `x86_64-unknown-linux-gnu` on `ubuntu-24.04`
+```bash
+cargo run --bin disc -- --help
+```
 
-Create a release tag:
+### Local wrapper
+
+```bash
+./disc.sh auth whoami
+```
+
+Defaults:
+
+- HTTP: `http://localhost:3001`
+- WS: `ws://localhost:8097`
+- Client ID: `disc-cli-local`
+
+Env precedence:
+
+1. `DISC_LOCAL_API_KEY`
+2. `DISC_API_KEY`
+3. stored CLI auth
+
+---
+
+## Release & distribution (maintainers)
+
+`disc-cli` is distributed as **prebuilt binaries** via GitHub Releases and installed via Homebrew.
+
+Create a release:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow will publish:
+Artifacts:
 
-- `disc-aarch64-apple-darwin.tar.gz`
-- `disc-x86_64-apple-darwin.tar.gz`
-- `disc-x86_64-unknown-linux-gnu.tar.gz`
+- `disc-<target>.tar.gz`
 - `SHA256SUMS.txt`
-- `disc.rb`
+- `disc.rb` (Homebrew formula)
 
-Local packaging smoke test:
+---
 
-```bash
-cargo build --locked --release --bin disc
-./scripts/package-release.sh \
-  --binary ./target/release/disc \
-  --target "$(rustc -vV | sed -n 's/^host: //p')" \
-  --output-dir ./dist
-```
+## Design principles
 
-Local formula rendering smoke test:
+- 🧩 Native Rust binary (no runtime dependencies)
+- 🔌 Unix-first (stdout streaming, pipe-friendly)
+- ⚡ Low-latency real-time consumption
+- 🧱 Stable CLI interface over evolving backend
 
-```bash
-./scripts/package-release.sh \
-  --binary ./target/release/disc \
-  --target aarch64-apple-darwin \
-  --output-dir ./dist
-./scripts/package-release.sh \
-  --binary ./target/release/disc \
-  --target x86_64-apple-darwin \
-  --output-dir ./dist
-./scripts/package-release.sh \
-  --binary ./target/release/disc \
-  --target x86_64-unknown-linux-gnu \
-  --output-dir ./dist
-shasum -a 256 ./dist/disc-*.tar.gz > ./dist/SHA256SUMS.txt
-python3 ./scripts/render_homebrew_formula.py \
-  --version 0.1.0 \
-  --release-base-url https://github.com/disctech/disc-cli/releases/download/v0.1.0 \
-  --checksums ./dist/SHA256SUMS.txt \
-  --output ./dist/disc.rb
-```
+---
 
-Publish to the tap after the GitHub release completes:
+## License
 
-```bash
-brew tap disctech/tap
-brew install disctech/tap/disc
-disc --version
-```
+See `LICENSE`.
+

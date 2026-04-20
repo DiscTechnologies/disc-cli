@@ -602,8 +602,27 @@ fn resolve_api_key_input(value: Option<String>, stdin: bool) -> Result<String> {
     }
 }
 
+fn strip_ansi_sequences(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some('[') = chars.next() {
+                for next in chars.by_ref() {
+                    if matches!(next, '\x40'..='\x7e') {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn validate_api_key(raw_value: String) -> Result<String> {
-    let trimmed = raw_value.trim().to_owned();
+    let trimmed = strip_ansi_sequences(&raw_value).trim().to_owned();
     if trimmed.is_empty() {
         anyhow::bail!("API key cannot be empty.");
     }

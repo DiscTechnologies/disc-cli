@@ -219,8 +219,18 @@ where
                 .context("Failed to construct websocket auth protocols header.")?,
         );
 
-        let (ws_stream, _) = connect_async(request)
-            .await
+        let connection_result = if capture_ctrl_c {
+            select! {
+                result = connect_async(request) => result,
+                maybe_signal = tokio::signal::ctrl_c() => {
+                    maybe_signal.context("Failed to wait for Ctrl+C.")?;
+                    return Ok(());
+                }
+            }
+        } else {
+            connect_async(request).await
+        };
+        let (ws_stream, _) = connection_result
             .with_context(|| format!("Failed to connect to websocket at {ws_url}."))?;
         let (mut writer, mut reader) = ws_stream.split();
 
@@ -279,7 +289,17 @@ where
             return Ok(());
         }
 
-        sleep(DEFAULT_RECONNECT_DELAY).await;
+        if capture_ctrl_c {
+            select! {
+                _ = sleep(DEFAULT_RECONNECT_DELAY) => {}
+                maybe_signal = tokio::signal::ctrl_c() => {
+                    maybe_signal.context("Failed to wait for Ctrl+C.")?;
+                    return Ok(());
+                }
+            }
+        } else {
+            sleep(DEFAULT_RECONNECT_DELAY).await;
+        }
     }
 }
 
@@ -412,6 +432,18 @@ fn decode_value(value: Value) -> Result<Option<InboundEvent>> {
             items,
             meta,
         }));
+    }
+
+    if event_type == "ERROR" {
+        let message = object
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown server error");
+        let code = object
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(anyhow::anyhow!("[{code}] {message}"));
     }
 
     Ok(Some(InboundEvent::Control(value)))

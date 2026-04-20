@@ -2,3 +2,5 @@
 /dist
 /.release-work
 /disc-signals.ndjson
+/.env.local
+/.env.prod

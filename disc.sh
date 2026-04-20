@@ -4,19 +4,41 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DISC_LOCAL_HTTP_BASE_URL="${DISC_LOCAL_HTTP_BASE_URL:-http://localhost:3001}"
-DISC_LOCAL_WS_URL="${DISC_LOCAL_WS_URL:-ws://localhost:8097}"
-DISC_LOCAL_CLIENT_ID="${DISC_LOCAL_CLIENT_ID:-disc-cli-local}"
-DISC_LOCAL_API_KEY="${DISC_LOCAL_API_KEY:-${DISC_API_KEY:-}}"
+# Extract --env <name> from args (default: local)
+ENV="local"
+PASS_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env)
+      [[ $# -ge 2 ]] || { echo "disc.sh: --env requires an argument" >&2; exit 1; }
+      ENV="$2"
+      shift 2
+      ;;
+    *)
+      PASS_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
 
-EXTRA_ARGS=(
-  "--http-base-url" "${DISC_LOCAL_HTTP_BASE_URL}"
-  "--ws-url" "${DISC_LOCAL_WS_URL}"
-  "--client-id" "${DISC_LOCAL_CLIENT_ID}"
-)
-
-if [[ -n "${DISC_LOCAL_API_KEY}" ]]; then
-  EXTRA_ARGS+=("--api-key" "${DISC_LOCAL_API_KEY}")
+# Load .env.<env> file
+ENV_FILE="${SCRIPT_DIR}/.env.${ENV}"
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${ENV_FILE}"
+  set +a
+else
+  echo "disc.sh: ${ENV_FILE} not found — create it from .env.example" >&2
+  exit 1
 fi
 
-exec cargo run --bin disc -- "${EXTRA_ARGS[@]}" "$@"
+# Build CLI flags from env vars (only when non-empty)
+EXTRA_ARGS=()
+
+[[ -n "${DISC_HTTP_BASE_URL:-}" ]] && EXTRA_ARGS+=("--http-base-url" "${DISC_HTTP_BASE_URL}")
+[[ -n "${DISC_WS_URL:-}"        ]] && EXTRA_ARGS+=("--ws-url"        "${DISC_WS_URL}")
+[[ -n "${DISC_CLIENT_ID:-}"     ]] && EXTRA_ARGS+=("--client-id"     "${DISC_CLIENT_ID}")
+[[ -n "${DISC_API_KEY:-}"       ]] && EXTRA_ARGS+=("--api-key"       "${DISC_API_KEY}")
+
+exec cargo run --bin disc -- "${EXTRA_ARGS[@]}" "${PASS_ARGS[@]}"
