@@ -8,7 +8,7 @@ from pathlib import Path
 
 TARGETS = (
     ("aarch64-apple-darwin", "OS.mac? && Hardware::CPU.arm?"),
-    ("x86_64-apple-darwin", "OS.mac? && Hardware::CPU.intel?"),
+    # ("x86_64-apple-darwin", "OS.mac? && Hardware::CPU.intel?"),
     ("x86_64-unknown-linux-gnu", "OS.linux? && Hardware::CPU.intel?"),
 )
 
