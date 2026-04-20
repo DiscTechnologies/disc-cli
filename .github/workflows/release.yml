@@ -1,0 +1,89 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin disc
+
+      - name: Package release archive
+        run: |
+          ./scripts/package-release.sh \
+            --binary ./target/release/disc \
+            --target "${{ matrix.target }}" \
+            --output-dir ./dist
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ./dist/disc-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd ./dist
+          shasum -a 256 disc-*.tar.gz > SHA256SUMS.txt
+
+      - name: Render Homebrew formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          release_base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          python3 ./scripts/render_homebrew_formula.py \
+            --version "$version" \
+            --release-base-url "$release_base_url" \
+            --checksums ./dist/SHA256SUMS.txt \
+            --output ./dist/disc.rb
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./dist/disc-aarch64-apple-darwin.tar.gz
+            ./dist/disc-x86_64-apple-darwin.tar.gz
+            ./dist/disc-x86_64-unknown-linux-gnu.tar.gz
+            ./dist/SHA256SUMS.txt
+            ./dist/disc.rb
