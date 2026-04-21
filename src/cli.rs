@@ -56,7 +56,26 @@ pub enum RootCommand {
     #[command(subcommand)]
     Auth(AuthCommand),
     #[command(subcommand)]
+    Config(ConfigCommand),
+    #[command(subcommand)]
     Signals(SignalsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    #[command(about = "Show effective configuration")]
+    Show,
+    #[command(about = "Update stored configuration")]
+    Set {
+        #[arg(long)]
+        http_base_url: Option<String>,
+        #[arg(long)]
+        ws_url: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+    },
+    #[command(about = "Reset stored configuration to defaults")]
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]

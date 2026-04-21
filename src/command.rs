@@ -7,7 +7,7 @@ use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 use tokio::task::JoinHandle;
 
 use crate::cli::{
-    ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, InteractiveSubscribeCommand,
+    ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand, InteractiveSubscribeCommand,
     PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand, StreamOptions, TailCommand,
 };
 use crate::config::{ConfigStore, StoredAuth};
@@ -29,6 +29,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         RootCommand::Auth(command) => {
             run_auth(command, api_key, http_base_url, ws_url, client_id, &store).await
         }
+        RootCommand::Config(command) => run_config(command, &store),
         RootCommand::Signals(command) => {
             run_signals(command, api_key, http_base_url, ws_url, client_id, &store).await
         }
@@ -87,6 +88,45 @@ async fn run_auth(
             Ok(())
         }
     }
+}
+
+fn run_config(command: ConfigCommand, store: &ConfigStore) -> Result<()> {
+    match command {
+        ConfigCommand::Show => {
+            let stored = store.load_config()?;
+            let http_base_url = stored
+                .http_base_url
+                .unwrap_or_else(|| "https://api.disc.tech (default)".to_owned());
+            let ws_url = stored
+                .ws_url
+                .unwrap_or_else(|| "wss://signals.disc.tech (default)".to_owned());
+            let client_id = stored
+                .client_id
+                .unwrap_or_else(|| "(not set)".to_owned());
+            println!("http_base_url: {http_base_url}");
+            println!("ws_url:        {ws_url}");
+            println!("client_id:     {client_id}");
+        }
+        ConfigCommand::Set { http_base_url, ws_url, client_id } => {
+            let mut config = store.load_config()?;
+            if let Some(url) = http_base_url {
+                config.http_base_url = Some(url);
+            }
+            if let Some(url) = ws_url {
+                config.ws_url = Some(url);
+            }
+            if let Some(id) = client_id {
+                config.client_id = Some(id);
+            }
+            store.save_config(&config)?;
+            println!("Configuration updated.");
+        }
+        ConfigCommand::Reset => {
+            store.save_config(&Default::default())?;
+            println!("Configuration reset to defaults.");
+        }
+    }
+    Ok(())
 }
 
 async fn run_signals(

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(disc --version)",
+      "Bash(disc auth *)",
+      "Bash(cargo build *)",
+      "Bash(cargo run *)",
+      "Bash(git -C /Users/ruchevits/Projects/Disc/disc-cli remote -v)",
+      "Bash(brew tap *)",
+      "Bash(brew tap-info *)",
+      "Read(//opt/homebrew/Library/Taps/disctechnologies/homebrew-tap/**)",
+      "Read(//opt/homebrew/Library/Taps/disctechnologies/homebrew-tap/Formula/**)"
+    ]
+  }
+}
