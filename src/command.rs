@@ -7,8 +7,9 @@ use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 use tokio::task::JoinHandle;
 
 use crate::cli::{
-    ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand, InteractiveSubscribeCommand,
-    PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand, StreamOptions, TailCommand,
+    ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand,
+    InteractiveSubscribeCommand, PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand,
+    StreamOptions, TailCommand,
 };
 use crate::config::{ConfigStore, StoredAuth};
 use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
@@ -17,6 +18,15 @@ use crate::output::{
     should_emit_event, validate_to_json, write_subscription_event,
 };
 use crate::ws::{SubscriptionKind, SubscriptionSpec, run_subscription};
+
+struct ReconcileSubscriptionContext<'a> {
+    writer: &'a SharedWriter,
+    ws_url: &'a str,
+    api_key: &'a str,
+    client_id: Option<&'a str>,
+    options: &'a StreamOptions,
+    format: crate::cli::StreamOutputFormat,
+}
 
 pub async fn run(cli: Cli) -> Result<()> {
     let store = ConfigStore::discover()?;
@@ -100,14 +110,16 @@ fn run_config(command: ConfigCommand, store: &ConfigStore) -> Result<()> {
             let ws_url = stored
                 .ws_url
                 .unwrap_or_else(|| "wss://signals.disc.tech (default)".to_owned());
-            let client_id = stored
-                .client_id
-                .unwrap_or_else(|| "(not set)".to_owned());
+            let client_id = stored.client_id.unwrap_or_else(|| "(not set)".to_owned());
             println!("http_base_url: {http_base_url}");
             println!("ws_url:        {ws_url}");
             println!("client_id:     {client_id}");
         }
-        ConfigCommand::Set { http_base_url, ws_url, client_id } => {
+        ConfigCommand::Set {
+            http_base_url,
+            ws_url,
+            client_id,
+        } => {
             let mut config = store.load_config()?;
             if let Some(url) = http_base_url {
                 config.http_base_url = Some(url);
@@ -370,12 +382,14 @@ async fn run_interactive_subscribe(
             2 => {
                 reconcile_subscriptions(
                     &mut tasks,
-                    &writer,
-                    ws_url,
-                    api_key,
-                    client_id,
-                    &command.options,
-                    command.format,
+                    ReconcileSubscriptionContext {
+                        writer: &writer,
+                        ws_url,
+                        api_key,
+                        client_id,
+                        options: &command.options,
+                        format: command.format,
+                    },
                     &selected_passive_ids,
                     &selected_active_ids,
                 );
@@ -398,12 +412,14 @@ async fn run_interactive_subscribe(
 
         reconcile_subscriptions(
             &mut tasks,
-            &writer,
-            ws_url,
-            api_key,
-            client_id,
-            &command.options,
-            command.format,
+            ReconcileSubscriptionContext {
+                writer: &writer,
+                ws_url,
+                api_key,
+                client_id,
+                options: &command.options,
+                format: command.format,
+            },
             &selected_passive_ids,
             &selected_active_ids,
         );
@@ -412,12 +428,7 @@ async fn run_interactive_subscribe(
 
 fn reconcile_subscriptions(
     tasks: &mut HashMap<SubscriptionSpec, JoinHandle<()>>,
-    writer: &SharedWriter,
-    ws_url: &str,
-    api_key: &str,
-    client_id: Option<&str>,
-    options: &crate::cli::StreamOptions,
-    format: crate::cli::StreamOutputFormat,
+    context: ReconcileSubscriptionContext<'_>,
     selected_passive_ids: &HashSet<String>,
     selected_active_ids: &HashSet<String>,
 ) {
@@ -440,10 +451,10 @@ fn reconcile_subscriptions(
     let existing_specs = tasks.keys().cloned().collect::<Vec<_>>();
 
     for spec in existing_specs {
-        if desired_specs.contains(&spec) == false {
-            if let Some(task) = tasks.remove(&spec) {
-                task.abort();
-            }
+        if !desired_specs.contains(&spec)
+            && let Some(task) = tasks.remove(&spec)
+        {
+            task.abort();
         }
     }
 
@@ -452,11 +463,12 @@ fn reconcile_subscriptions(
             continue;
         }
 
-        let writer = writer.clone();
-        let ws_url = ws_url.to_owned();
-        let api_key = api_key.to_owned();
-        let client_id = client_id.map(str::to_owned);
-        let options = options.clone();
+        let writer = context.writer.clone();
+        let ws_url = context.ws_url.to_owned();
+        let api_key = context.api_key.to_owned();
+        let client_id = context.client_id.map(str::to_owned);
+        let options = context.options.clone();
+        let format = context.format;
         let spec_for_task = spec.clone();
         let task = tokio::spawn(async move {
             let _ = run_subscription(

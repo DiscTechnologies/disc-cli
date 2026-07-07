@@ -151,7 +151,7 @@ impl DiscApiClient {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
-        if status.is_success() == false {
+        if !status.is_success() {
             let sanitized_body = if body.is_empty() {
                 "<empty body>".to_owned()
             } else {

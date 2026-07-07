@@ -89,7 +89,7 @@ pub fn should_emit_event(event: &InboundEvent, output_filter: StreamOutputFilter
     match output_filter {
         StreamOutputFilter::All => true,
         StreamOutputFilter::Events => event.is_control_event(),
-        StreamOutputFilter::Data => event.is_data_event() && event.is_status_stream() == false,
+        StreamOutputFilter::Data => event.is_data_event() && !event.is_status_stream(),
         StreamOutputFilter::Status => event.is_status_stream(),
     }
 }

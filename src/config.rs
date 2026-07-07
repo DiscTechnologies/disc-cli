@@ -86,9 +86,9 @@ impl ConfigStore {
         let stored_auth = self.load_auth()?;
 
         let api_key = match cli_api_key {
-            Some(value) if value.is_empty() == false => value.to_owned(),
+            Some(value) if !value.is_empty() => value.to_owned(),
             _ => match stored_auth {
-                Some(auth) if auth.api_key.is_empty() == false => auth.api_key,
+                Some(auth) if !auth.api_key.is_empty() => auth.api_key,
                 _ => bail!(
                     "API key is not configured. Run `disc auth api-key set` or pass `--api-key`."
                 ),
@@ -106,7 +106,7 @@ impl ConfigStore {
         let client_id = cli_client_id
             .map(str::to_owned)
             .or(stored_config.client_id)
-            .filter(|value| value.is_empty() == false);
+            .filter(|value| !value.is_empty());
 
         Ok(EffectiveConfig {
             api_key,
@@ -131,7 +131,7 @@ impl ConfigStore {
         T: for<'de> Deserialize<'de>,
     {
         let path = self.root_dir.join(name);
-        if path.exists() == false {
+        if !path.exists() {
             return Ok(None);
         }
 
@@ -167,16 +167,16 @@ impl ConfigStore {
                 .with_context(|| format!("Failed to write {}.", path.display()))?;
             file.write_all(b"\n")
                 .with_context(|| format!("Failed to finalize {}.", path.display()))?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(unix))]
         {
-            fs::write(&path, serde_json::to_string_pretty(value)?)
+            let serialized = serde_json::to_string_pretty(value)
+                .with_context(|| format!("Failed to serialize {}.", path.display()))?;
+            fs::write(&path, format!("{serialized}\n"))
                 .with_context(|| format!("Failed to write {}.", path.display()))?;
-            fs::write(&path, format!("{}\n", serde_json::to_string_pretty(value)?))
-                .with_context(|| format!("Failed to write {}.", path.display()))?;
-            return Ok(());
+            Ok(())
         }
     }
 }
@@ -188,6 +188,6 @@ mod tests {
     #[test]
     fn discover_returns_non_empty_root_dir() {
         let store = ConfigStore::discover().expect("config store");
-        assert!(store.root_dir().as_os_str().is_empty() == false);
+        assert!(!store.root_dir().as_os_str().is_empty());
     }
 }
