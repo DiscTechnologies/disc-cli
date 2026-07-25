@@ -73,7 +73,7 @@ impl ConfigStore {
         let path = self.root_dir.join("auth.json");
         if path.exists() {
             fs::remove_file(&path)
-                .with_context(|| format!("Failed to remove auth file at {}.", path.display()))?;
+                .context(format!("Failed to remove auth file at {}.", path.display()))?;
             return Ok(true);
         }
 
@@ -122,12 +122,10 @@ impl ConfigStore {
     }
 
     fn ensure_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.root_dir).with_context(|| {
-            format!(
-                "Failed to create Disc CLI config directory at {}.",
-                self.root_dir.display()
-            )
-        })?;
+        fs::create_dir_all(&self.root_dir).context(format!(
+            "Failed to create Disc CLI config directory at {}.",
+            self.root_dir.display()
+        ))?;
         Ok(())
     }
 
@@ -140,10 +138,10 @@ impl ConfigStore {
             return Ok(None);
         }
 
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}.", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).context(format!("Failed to read {}.", path.display()))?;
         let parsed = serde_json::from_str::<T>(&raw)
-            .with_context(|| format!("Failed to parse {}.", path.display()))?;
+            .context(format!("Failed to parse {}.", path.display()))?;
         Ok(Some(parsed))
     }
 
@@ -155,7 +153,7 @@ impl ConfigStore {
 
         let path = self.root_dir.join(name);
         let json = serde_json::to_vec_pretty(value)
-            .with_context(|| format!("Failed to serialize {}.", path.display()))?;
+            .context(format!("Failed to serialize {}.", path.display()))?;
 
         #[cfg(unix)]
         {
@@ -167,20 +165,20 @@ impl ConfigStore {
                 .truncate(true)
                 .mode(0o600)
                 .open(&path)
-                .with_context(|| format!("Failed to open {} for writing.", path.display()))?;
+                .context(format!("Failed to open {} for writing.", path.display()))?;
             file.write_all(&json)
-                .with_context(|| format!("Failed to write {}.", path.display()))?;
+                .context(format!("Failed to write {}.", path.display()))?;
             file.write_all(b"\n")
-                .with_context(|| format!("Failed to finalize {}.", path.display()))?;
+                .context(format!("Failed to finalize {}.", path.display()))?;
             Ok(())
         }
 
         #[cfg(not(unix))]
         {
             let serialized = serde_json::to_string_pretty(value)
-                .with_context(|| format!("Failed to serialize {}.", path.display()))?;
+                .context(format!("Failed to serialize {}.", path.display()))?;
             fs::write(&path, format!("{serialized}\n"))
-                .with_context(|| format!("Failed to write {}.", path.display()))?;
+                .context(format!("Failed to write {}.", path.display()))?;
             Ok(())
         }
     }
@@ -359,5 +357,20 @@ mod tests {
             .expect_err("directory open should fail");
         assert!(write_error.to_string().contains("Failed to open"));
         cleanup(&store);
+    }
+
+    #[test]
+    fn directory_creation_failures_include_the_config_path() {
+        let parent = test_store("directory-error");
+        fs::write(&parent.root_dir, "not a directory").expect("create blocking file");
+        let store = ConfigStore::from_root(parent.root_dir.join("child"));
+
+        let error = store
+            .save_config(&StoredConfig::default())
+            .expect_err("directory creation should fail");
+
+        assert!(error.to_string().contains("Failed to create"));
+        assert!(error.to_string().contains("child"));
+        fs::remove_file(&parent.root_dir).expect("remove blocking file");
     }
 }

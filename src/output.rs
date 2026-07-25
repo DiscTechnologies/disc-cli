@@ -356,6 +356,7 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
+        std::fs::write(&path, "stale").expect("create stale output");
         if path.exists() {
             std::fs::remove_file(&path).expect("remove stale output");
         }

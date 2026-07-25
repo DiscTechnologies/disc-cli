@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::Path;
+use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
@@ -26,6 +28,84 @@ struct ReconcileSubscriptionContext<'a> {
     client_id: Option<&'a str>,
     options: &'a StreamOptions,
     format: crate::cli::StreamOutputFormat,
+}
+
+trait SubscriptionPrompter {
+    fn choose_action(&mut self) -> Result<usize>;
+    fn select_passive_signals(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+        selected_passive_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>>;
+    fn choose_passive_parent(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+    ) -> Result<PassiveSignalSummary>;
+    fn select_active_signals(
+        &mut self,
+        active_signals: &[ActiveSignalSummary],
+        selected_active_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>>;
+    fn wait_for_shutdown(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+struct DialogSubscriptionPrompter {
+    theme: ColorfulTheme,
+}
+
+impl DialogSubscriptionPrompter {
+    fn new() -> Self {
+        Self {
+            theme: ColorfulTheme::default(),
+        }
+    }
+}
+
+impl SubscriptionPrompter for DialogSubscriptionPrompter {
+    fn choose_action(&mut self) -> Result<usize> {
+        Select::with_theme(&self.theme)
+            .with_prompt("Manage subscriptions")
+            .items(&[
+                "Edit passive signals",
+                "Edit active signals",
+                "Finish and keep current subscriptions running",
+                "Quit and stop all subscriptions",
+            ])
+            .default(0)
+            .interact()
+            .context("Failed to read interactive selection.")
+    }
+
+    fn select_passive_signals(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+        selected_passive_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        prompt_passive_signal_selection(&self.theme, passive_signals, selected_passive_ids)
+    }
+
+    fn choose_passive_parent(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+    ) -> Result<PassiveSignalSummary> {
+        prompt_passive_parent(&self.theme, passive_signals)
+    }
+
+    fn select_active_signals(
+        &mut self,
+        active_signals: &[ActiveSignalSummary],
+        selected_active_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        prompt_active_signal_selection(&self.theme, active_signals, selected_active_ids)
+    }
+
+    fn wait_for_shutdown(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async {
+            tokio::signal::ctrl_c()
+                .await
+                .context("Failed to wait for Ctrl+C.")
+        })
+    }
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -315,9 +395,31 @@ async fn run_interactive_subscribe(
     client_id: Option<&str>,
     command: &InteractiveSubscribeCommand,
 ) -> Result<()> {
+    let mut prompter = DialogSubscriptionPrompter::new();
+    run_interactive_subscribe_with_prompter(
+        client,
+        ws_url,
+        api_key,
+        client_id,
+        command,
+        &mut prompter,
+    )
+    .await
+}
+
+async fn run_interactive_subscribe_with_prompter<P>(
+    client: &DiscApiClient,
+    ws_url: &str,
+    api_key: &str,
+    client_id: Option<&str>,
+    command: &InteractiveSubscribeCommand,
+    prompter: &mut P,
+) -> Result<()>
+where
+    P: SubscriptionPrompter,
+{
     let passive_signals = client.list_passive_signal_summaries().await?;
     let writer = create_file_writer(&command.destination)?;
-    let theme = ColorfulTheme::default();
     let mut selected_passive_ids = HashSet::<String>::new();
     let mut selected_active_ids = HashSet::<String>::new();
     let mut active_signal_cache = HashMap::<String, Vec<ActiveSignalSummary>>::new();
@@ -332,32 +434,19 @@ async fn run_interactive_subscribe(
             &command.destination,
         );
 
-        let action = Select::with_theme(&theme)
-            .with_prompt("Manage subscriptions")
-            .items(&[
-                "Edit passive signals",
-                "Edit active signals",
-                "Finish and keep current subscriptions running",
-                "Quit and stop all subscriptions",
-            ])
-            .default(0)
-            .interact()
-            .context("Failed to read interactive selection.")?;
+        let action = prompter.choose_action()?;
 
         match action {
             0 => {
-                let next_selected = prompt_passive_signal_selection(
-                    &theme,
-                    &passive_signals,
-                    &selected_passive_ids,
-                )?;
+                let next_selected =
+                    prompter.select_passive_signals(&passive_signals, &selected_passive_ids)?;
                 selected_passive_ids = next_selected;
             }
             1 => {
                 if passive_signals.is_empty() {
                     println!("No passive signals available.");
                 } else {
-                    let passive_signal = prompt_passive_parent(&theme, &passive_signals)?;
+                    let passive_signal = prompter.choose_passive_parent(&passive_signals)?;
                     let active_signals = match active_signal_cache
                         .get(&passive_signal.passive_signal_id)
                     {
@@ -375,11 +464,8 @@ async fn run_interactive_subscribe(
                     if active_signals.is_empty() {
                         println!("No active signals under `{}`.", passive_signal.label);
                     } else {
-                        selected_active_ids = prompt_active_signal_selection(
-                            &theme,
-                            &active_signals,
-                            &selected_active_ids,
-                        )?;
+                        selected_active_ids = prompter
+                            .select_active_signals(&active_signals, &selected_active_ids)?;
                     }
                 }
             }
@@ -401,9 +487,7 @@ async fn run_interactive_subscribe(
                     "Subscriptions are running. Output is being appended to {}. Press Ctrl+C to stop the CLI.",
                     command.destination.display()
                 );
-                tokio::signal::ctrl_c()
-                    .await
-                    .context("Failed to wait for Ctrl+C.")?;
+                prompter.wait_for_shutdown().await?;
                 abort_all_tasks(&mut tasks);
                 return Ok(());
             }
@@ -581,12 +665,17 @@ fn prompt_passive_signal_selection(
         .interact()
         .context("Failed to select passive signals.")?;
 
-    let next_selected = selection
+    Ok(passive_selection_from_indices(passive_signals, selection))
+}
+
+fn passive_selection_from_indices(
+    passive_signals: &[PassiveSignalSummary],
+    selection: Vec<usize>,
+) -> HashSet<String> {
+    selection
         .into_iter()
         .map(|index| passive_signals[index].passive_signal_id.clone())
-        .collect::<HashSet<_>>();
-
-    Ok(next_selected)
+        .collect()
 }
 
 fn prompt_passive_parent(
@@ -605,7 +694,14 @@ fn prompt_passive_parent(
         .interact()
         .context("Failed to choose passive signal.")?;
 
-    Ok(passive_signals[selection].clone())
+    Ok(passive_parent_from_index(passive_signals, selection))
+}
+
+fn passive_parent_from_index(
+    passive_signals: &[PassiveSignalSummary],
+    selection: usize,
+) -> PassiveSignalSummary {
+    passive_signals[selection].clone()
 }
 
 fn prompt_active_signal_selection(
@@ -629,6 +725,18 @@ fn prompt_active_signal_selection(
         .interact()
         .context("Failed to select active signals.")?;
 
+    Ok(active_selection_from_indices(
+        active_signals,
+        selected_active_ids,
+        selection,
+    ))
+}
+
+fn active_selection_from_indices(
+    active_signals: &[ActiveSignalSummary],
+    selected_active_ids: &HashSet<String>,
+    selection: Vec<usize>,
+) -> HashSet<String> {
     let mut next_selected = selected_active_ids.clone();
     next_selected.retain(|signal_id| {
         active_signals
@@ -639,7 +747,7 @@ fn prompt_active_signal_selection(
         next_selected.insert(active_signals[index].active_signal_id.clone());
     }
 
-    Ok(next_selected)
+    next_selected
 }
 
 fn resolve_api_key_input(value: Option<String>, stdin: bool) -> Result<String> {
@@ -688,6 +796,7 @@ fn validate_api_key(raw_value: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -752,6 +861,75 @@ mod tests {
         (format!("http://{address}"), receiver)
     }
 
+    fn spawn_response_sequence(bodies: Vec<&str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind sequence server");
+        let address = listener.local_addr().expect("sequence server address");
+        let bodies = bodies.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept sequence request");
+                let mut request = vec![0; 4096];
+                let _ = stream.read(&mut request).expect("read sequence request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("respond to sequence request");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    struct MockSubscriptionPrompter {
+        actions: VecDeque<usize>,
+        passive_selections: VecDeque<HashSet<String>>,
+        passive_parents: VecDeque<PassiveSignalSummary>,
+        active_selections: VecDeque<HashSet<String>>,
+        has_waited_for_shutdown: bool,
+    }
+
+    impl SubscriptionPrompter for MockSubscriptionPrompter {
+        fn choose_action(&mut self) -> Result<usize> {
+            Ok(self.actions.pop_front().expect("next action"))
+        }
+
+        fn select_passive_signals(
+            &mut self,
+            _passive_signals: &[PassiveSignalSummary],
+            _selected_passive_ids: &HashSet<String>,
+        ) -> Result<HashSet<String>> {
+            Ok(self
+                .passive_selections
+                .pop_front()
+                .expect("passive selection"))
+        }
+
+        fn choose_passive_parent(
+            &mut self,
+            _passive_signals: &[PassiveSignalSummary],
+        ) -> Result<PassiveSignalSummary> {
+            Ok(self.passive_parents.pop_front().expect("passive parent"))
+        }
+
+        fn select_active_signals(
+            &mut self,
+            _active_signals: &[ActiveSignalSummary],
+            _selected_active_ids: &HashSet<String>,
+        ) -> Result<HashSet<String>> {
+            Ok(self
+                .active_selections
+                .pop_front()
+                .expect("active selection"))
+        }
+
+        fn wait_for_shutdown(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.has_waited_for_shutdown = true;
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
     async fn accept_websocket(stream: TcpStream) -> WebSocketStream<TcpStream> {
         tokio_tungstenite::accept_hdr_async(stream, |request: &Request, mut response: Response| {
             let protocol = request
@@ -785,12 +963,17 @@ mod tests {
             let subscribe = websocket.next().await.expect("subscribe").expect("frame");
             assert!(matches!(subscribe, Message::Binary(_)));
             websocket
+                .send(Message::Text(r#"{"type":"READY"}"#.into()))
+                .await
+                .expect("send control event");
+            websocket
                 .send(Message::Text(
                     r#"{"sk":"PASSIVE_SIGNAL:signal:ordinal","sq":1,"k":"psr","at":1,"p":{"value":7}}"#
                         .into(),
                 ))
                 .await
                 .expect("send event");
+            websocket.close(None).await.expect("close websocket");
         });
         (format!("ws://{address}"), task)
     }
@@ -1031,6 +1214,34 @@ mod tests {
             .await
             .expect("tail command");
         server.await.expect("tail server");
+
+        let (ws_url, server) = spawn_websocket_event().await;
+        let mut continuous_stream = stream;
+        continuous_stream.options.once = false;
+        run_stream_command(
+            SubscriptionKind::Passive,
+            &ws_url,
+            "key",
+            None,
+            &continuous_stream,
+        )
+        .await
+        .expect("continuous stream command");
+        server.await.expect("continuous stream server");
+
+        let (ws_url, server) = spawn_websocket_event().await;
+        let mut continuous_tail = tail;
+        continuous_tail.once = false;
+        run_tail_command(
+            SubscriptionKind::Active,
+            &ws_url,
+            "key",
+            None,
+            &continuous_tail,
+        )
+        .await
+        .expect("continuous tail command");
+        server.await.expect("continuous tail server");
         cleanup(&store);
     }
 
@@ -1145,6 +1356,209 @@ mod tests {
         cleanup(&store);
     }
 
+    #[tokio::test]
+    async fn interactive_subscription_handles_empty_signal_catalogue() {
+        let store = test_store("interactive-empty");
+        std::fs::create_dir_all(store.root_dir()).expect("create interactive directory");
+        let base_url = spawn_response_sequence(vec![r#"{"passiveSignals":[]}"#]);
+        let client = DiscApiClient::new(base_url, "key").expect("interactive client");
+        let command = InteractiveSubscribeCommand {
+            options: stream_options_once(),
+            format: StreamOutputFormat::Ndjson,
+            destination: store.root_dir().join("events.ndjson"),
+        };
+        let mut prompter = MockSubscriptionPrompter {
+            actions: VecDeque::from([1, 3]),
+            passive_selections: VecDeque::new(),
+            passive_parents: VecDeque::new(),
+            active_selections: VecDeque::new(),
+            has_waited_for_shutdown: false,
+        };
+
+        run_interactive_subscribe_with_prompter(
+            &client,
+            "ws://unused",
+            "key",
+            None,
+            &command,
+            &mut prompter,
+        )
+        .await
+        .expect("empty interactive flow");
+        assert!(!prompter.has_waited_for_shutdown);
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn interactive_subscription_edits_signals_caches_results_and_finishes() {
+        let store = test_store("interactive-edit");
+        std::fs::create_dir_all(store.root_dir()).expect("create interactive directory");
+        let base_url = spawn_response_sequence(vec![
+            r#"{"passiveSignals":[{"passiveSignalId":"p1","label":"One"},{"passiveSignalId":"p2","label":"Two"}]}"#,
+            r#"{"activeSignals":[{"activeSignalId":"a1","passiveSignalId":"p1","label":"Active"}]}"#,
+            r#"{"activeSignals":[]}"#,
+        ]);
+        let client = DiscApiClient::new(base_url, "key").expect("interactive client");
+        let command = InteractiveSubscribeCommand {
+            options: stream_options_once(),
+            format: StreamOutputFormat::Json,
+            destination: store.root_dir().join("events.json"),
+        };
+        let p1 = PassiveSignalSummary {
+            passive_signal_id: "p1".to_owned(),
+            label: "One".to_owned(),
+        };
+        let p2 = PassiveSignalSummary {
+            passive_signal_id: "p2".to_owned(),
+            label: "Two".to_owned(),
+        };
+        let mut prompter = MockSubscriptionPrompter {
+            actions: VecDeque::from([0, 1, 1, 1, 2]),
+            passive_selections: VecDeque::from([HashSet::from(["p1".to_owned()])]),
+            passive_parents: VecDeque::from([p1.clone(), p1, p2]),
+            active_selections: VecDeque::from([
+                HashSet::from(["a1".to_owned()]),
+                HashSet::from(["a1".to_owned()]),
+            ]),
+            has_waited_for_shutdown: false,
+        };
+
+        run_interactive_subscribe_with_prompter(
+            &client,
+            "not a websocket url",
+            "key",
+            Some("client"),
+            &command,
+            &mut prompter,
+        )
+        .await
+        .expect("interactive edit flow");
+        assert!(prompter.has_waited_for_shutdown);
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn interactive_entrypoint_reports_destination_creation_errors() {
+        let store = test_store("interactive-entrypoint");
+        let base_url = spawn_response_sequence(vec![r#"{"passiveSignals":[]}"#]);
+        let client = DiscApiClient::new(base_url, "key").expect("interactive client");
+        let command = InteractiveSubscribeCommand {
+            options: stream_options_once(),
+            format: StreamOutputFormat::Ndjson,
+            destination: store.root_dir().join("missing").join("events.ndjson"),
+        };
+
+        let error = run_interactive_subscribe(&client, "ws://unused", "key", None, &command)
+            .await
+            .expect_err("destination error");
+        assert!(error.to_string().contains("Failed to open"));
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn interactive_signal_route_dispatches_to_the_entrypoint() {
+        let store = test_store("interactive-route");
+        let base_url = spawn_response_sequence(vec![r#"{"passiveSignals":[]}"#]);
+        let command = InteractiveSubscribeCommand {
+            options: stream_options_once(),
+            format: StreamOutputFormat::Ndjson,
+            destination: store.root_dir().join("missing").join("events.ndjson"),
+        };
+
+        let error = run_signals(
+            SignalsCommand::Subscribe(command),
+            Some("key".to_owned()),
+            Some(base_url),
+            Some("ws://unused".to_owned()),
+            Some("client".to_owned()),
+            &store,
+        )
+        .await
+        .expect_err("interactive destination error");
+
+        assert!(error.to_string().contains("Failed to open"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn dialog_prompter_reports_unavailable_terminal_input() {
+        let mut prompter = DialogSubscriptionPrompter::new();
+        let passive_signals = vec![PassiveSignalSummary {
+            passive_signal_id: "passive".to_owned(),
+            label: "Passive".to_owned(),
+        }];
+        let active_signals = vec![ActiveSignalSummary {
+            active_signal_id: "active".to_owned(),
+            passive_signal_id: "passive".to_owned(),
+            label: "Active".to_owned(),
+        }];
+
+        assert!(prompter.choose_action().is_err());
+        assert!(
+            prompter
+                .select_passive_signals(&passive_signals, &HashSet::new())
+                .is_err()
+        );
+        assert!(prompter.choose_passive_parent(&passive_signals).is_err());
+        assert!(
+            prompter
+                .select_active_signals(&active_signals, &HashSet::new())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_shutdown_waiter_can_be_cancelled() {
+        let mut prompter = DialogSubscriptionPrompter::new();
+        let result =
+            tokio::time::timeout(Duration::from_millis(1), prompter.wait_for_shutdown()).await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dialog_selection_results_map_indices_and_preserve_other_parents() {
+        let passive_signals = vec![
+            PassiveSignalSummary {
+                passive_signal_id: "p1".to_owned(),
+                label: "One".to_owned(),
+            },
+            PassiveSignalSummary {
+                passive_signal_id: "p2".to_owned(),
+                label: "Two".to_owned(),
+            },
+        ];
+        assert_eq!(
+            passive_selection_from_indices(&passive_signals, vec![1]),
+            HashSet::from(["p2".to_owned()])
+        );
+        assert_eq!(
+            passive_parent_from_index(&passive_signals, 0).passive_signal_id,
+            "p1"
+        );
+
+        let active_signals = vec![
+            ActiveSignalSummary {
+                active_signal_id: "a1".to_owned(),
+                passive_signal_id: "p1".to_owned(),
+                label: "One".to_owned(),
+            },
+            ActiveSignalSummary {
+                active_signal_id: "a2".to_owned(),
+                passive_signal_id: "p1".to_owned(),
+                label: "Two".to_owned(),
+            },
+        ];
+        assert_eq!(
+            active_selection_from_indices(
+                &active_signals,
+                &HashSet::from(["other-parent".to_owned(), "a1".to_owned()]),
+                vec![1],
+            ),
+            HashSet::from(["other-parent".to_owned(), "a2".to_owned()])
+        );
+    }
+
     #[test]
     fn tail_options_copy_every_stream_setting() {
         let tail = TailCommand {
@@ -1239,6 +1653,31 @@ mod tests {
             &HashSet::new(),
         );
         assert!(tasks.is_empty());
+
+        let (ws_url, server) = spawn_websocket_event().await;
+        reconcile_subscriptions(
+            &mut tasks,
+            ReconcileSubscriptionContext {
+                writer: &writer,
+                ws_url: &ws_url,
+                api_key: "key",
+                client_id: None,
+                options: &options,
+                format: StreamOutputFormat::Ndjson,
+            },
+            &HashSet::from(["signal".to_owned()]),
+            &HashSet::new(),
+        );
+        server.await.expect("reconciled subscription server");
+        let spec = SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "signal".to_owned(),
+        };
+        let task = tasks.remove(&spec).expect("reconciled subscription task");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reconciled task timeout")
+            .expect("reconciled task");
 
         let task = tokio::spawn(std::future::pending::<()>());
         tasks.insert(

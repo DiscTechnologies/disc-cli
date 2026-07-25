@@ -597,9 +597,12 @@ mod tests {
             kind: SubscriptionKind::Active,
             signal_id: "active".to_owned(),
         };
-        let active_targets = build_targets(&active, &options());
-        assert_eq!(active_targets.len(), 1);
+        let mut active_options = options();
+        active_options.include_status = true;
+        let active_targets = build_targets(&active, &active_options);
+        assert_eq!(active_targets.len(), 2);
         assert_eq!(active_targets[0].target_type, "ACTIVE_SIGNAL_RESULT");
+        assert_eq!(active_targets[1].target_type, "ACTIVE_SIGNAL_STATUS");
         assert_eq!(active_targets[0].window_semantics, "ordinal");
         assert_eq!(
             active_targets[0].active_signal_id.as_deref(),
@@ -645,6 +648,8 @@ mod tests {
         .expect("backfill event");
         assert!(backfill.is_data_event());
         assert!(backfill.is_status_stream());
+        assert_eq!(backfill.as_json()["type"], "BACKFILL");
+        assert_eq!(backfill.as_json()["meta"]["count"], 1);
         assert!(backfill.pretty_line().contains("items=1"));
         assert!(backfill.pretty_line().contains("meta="));
 
