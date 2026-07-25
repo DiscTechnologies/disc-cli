@@ -47,6 +47,11 @@ impl ConfigStore {
         &self.root_dir
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_root(root_dir: PathBuf) -> Self {
+        Self { root_dir }
+    }
+
     pub fn load_config(&self) -> Result<StoredConfig> {
         self.read_json::<StoredConfig>("config.json")
             .map(|maybe| maybe.unwrap_or_default())
@@ -183,11 +188,176 @@ impl ConfigStore {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigStore;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{ConfigStore, StoredAuth, StoredConfig};
+
+    fn test_store(name: &str) -> ConfigStore {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root_dir = std::env::temp_dir().join(format!(
+            "disc-cli-config-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        ConfigStore { root_dir }
+    }
+
+    fn cleanup(store: &ConfigStore) {
+        if store.root_dir.exists() {
+            fs::remove_dir_all(&store.root_dir).expect("remove test config");
+        }
+    }
 
     #[test]
     fn discover_returns_non_empty_root_dir() {
         let store = ConfigStore::discover().expect("config store");
         assert!(!store.root_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn config_and_auth_round_trip_with_private_files() {
+        let store = test_store("round-trip");
+        let config = StoredConfig {
+            http_base_url: Some("http://localhost:8080".to_owned()),
+            ws_url: Some("ws://localhost:8081".to_owned()),
+            client_id: Some("client".to_owned()),
+        };
+        let auth = StoredAuth {
+            api_key: "secret".to_owned(),
+        };
+
+        assert_eq!(
+            store.load_config().expect("empty config").http_base_url,
+            None
+        );
+        assert!(store.load_auth().expect("empty auth").is_none());
+        store.save_config(&config).expect("save config");
+        store.save_auth(&auth).expect("save auth");
+
+        let loaded_config = store.load_config().expect("load config");
+        let loaded_auth = store.load_auth().expect("load auth").expect("stored auth");
+        assert_eq!(
+            loaded_config.http_base_url.as_deref(),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(loaded_auth.api_key, "secret");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(store.root_dir.join("auth.json"))
+                .expect("auth metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert!(store.clear_auth().expect("clear existing auth"));
+        assert!(!store.clear_auth().expect("clear missing auth"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn resolve_honours_cli_stored_and_default_precedence() {
+        let store = test_store("resolve");
+        store
+            .save_config(&StoredConfig {
+                http_base_url: Some("https://stored-http".to_owned()),
+                ws_url: Some("wss://stored-ws".to_owned()),
+                client_id: Some("stored-client".to_owned()),
+            })
+            .expect("save config");
+        store
+            .save_auth(&StoredAuth {
+                api_key: "stored-key".to_owned(),
+            })
+            .expect("save auth");
+
+        let stored = store
+            .resolve(None, None, None, None)
+            .expect("resolve stored");
+        assert_eq!(stored.api_key, "stored-key");
+        assert_eq!(stored.http_base_url, "https://stored-http");
+        assert_eq!(stored.ws_url, "wss://stored-ws");
+        assert_eq!(stored.client_id.as_deref(), Some("stored-client"));
+
+        let cli = store
+            .resolve(
+                Some("cli-key"),
+                Some("https://cli-http"),
+                Some("wss://cli-ws"),
+                Some(""),
+            )
+            .expect("resolve cli");
+        assert_eq!(cli.api_key, "cli-key");
+        assert_eq!(cli.http_base_url, "https://cli-http");
+        assert_eq!(cli.ws_url, "wss://cli-ws");
+        assert!(cli.client_id.is_none());
+
+        store
+            .save_config(&StoredConfig::default())
+            .expect("reset config");
+        let defaults = store
+            .resolve(Some("key"), None, None, None)
+            .expect("resolve defaults");
+        assert_eq!(defaults.http_base_url, "https://api.disc.tech");
+        assert_eq!(defaults.ws_url, "wss://signals.disc.tech");
+        cleanup(&store);
+    }
+
+    #[test]
+    fn resolve_requires_a_non_empty_api_key() {
+        let store = test_store("missing-key");
+        store
+            .save_auth(&StoredAuth {
+                api_key: String::new(),
+            })
+            .expect("save empty auth");
+
+        let error = store
+            .resolve(Some(""), None, None, None)
+            .expect_err("missing key should fail");
+        assert!(error.to_string().contains("API key is not configured"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn malformed_config_reports_its_path() {
+        let store = test_store("malformed");
+        fs::create_dir_all(&store.root_dir).expect("create config dir");
+        let path = store.root_dir.join("config.json");
+        fs::write(&path, "{").expect("write malformed config");
+
+        let error = store.load_config().expect_err("malformed config");
+        assert!(error.to_string().contains("Failed to parse"));
+        assert!(error.to_string().contains("config.json"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn read_and_write_failures_include_context() {
+        let store = test_store("io-errors");
+        fs::create_dir_all(&store.root_dir).expect("create root");
+        let config_path = store.root_dir.join("config.json");
+        fs::create_dir(&config_path).expect("create path as directory");
+
+        let read_error = store.load_config().expect_err("directory read should fail");
+        assert!(read_error.to_string().contains("Failed to read"));
+
+        let auth_path: PathBuf = store.root_dir.join("auth.json");
+        fs::create_dir(&auth_path).expect("create auth path as directory");
+        let write_error = store
+            .save_auth(&StoredAuth {
+                api_key: "key".to_owned(),
+            })
+            .expect_err("directory open should fail");
+        assert!(write_error.to_string().contains("Failed to open"));
+        cleanup(&store);
     }
 }

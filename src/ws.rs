@@ -469,9 +469,38 @@ fn compact_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::cell::Cell;
 
-    use super::{InboundEvent, decode_value};
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::{
+        Error,
+        protocol::{
+            Message,
+            frame::{
+                Frame,
+                coding::{Data, OpCode},
+            },
+        },
+    };
+
+    use crate::cli::{StreamOptions, WindowSemantics};
+
+    use super::*;
+
+    fn options() -> StreamOptions {
+        StreamOptions {
+            output: crate::cli::StreamOutputFilter::Data,
+            window_semantics: WindowSemantics::Ordinal,
+            backfill: false,
+            backfill_from: None,
+            backfill_to: None,
+            backfill_count: None,
+            include_status: false,
+            once: false,
+            timeout: None,
+            no_reconnect: true,
+        }
+    }
 
     #[test]
     fn decode_compact_data_frame_maps_to_data_event() {
@@ -498,5 +527,260 @@ mod tests {
             }
             _ => panic!("expected data event"),
         }
+    }
+
+    #[test]
+    fn subscription_kinds_and_targets_encode_all_options() {
+        let passive = SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "passive".to_owned(),
+        };
+        let mut passive_options = options();
+        passive_options.window_semantics = WindowSemantics::Elapsed;
+        passive_options.backfill = true;
+        passive_options.backfill_from = Some(10);
+        passive_options.backfill_to = Some(20);
+        passive_options.backfill_count = Some(5);
+        passive_options.include_status = true;
+
+        let passive_targets = build_targets(&passive, &passive_options);
+        assert_eq!(passive_targets.len(), 2);
+        assert_eq!(passive_targets[0].target_type, "PASSIVE_SIGNAL_RESULT");
+        assert_eq!(passive_targets[1].target_type, "PASSIVE_SIGNAL_STATUS");
+        assert_eq!(passive_targets[0].window_semantics, "elapsed");
+        assert_eq!(
+            passive_targets[0].passive_signal_id.as_deref(),
+            Some("passive")
+        );
+        assert!(passive_targets[0].active_signal_id.is_none());
+        assert_eq!(passive_targets[0].backfill, Some(true));
+        assert_eq!(passive_targets[0].backfill_from_epoch_ms, Some(10));
+        assert_eq!(passive_targets[0].backfill_to_epoch_ms, Some(20));
+        assert_eq!(passive_targets[0].backfill_count, Some(5));
+
+        let active = SubscriptionSpec {
+            kind: SubscriptionKind::Active,
+            signal_id: "active".to_owned(),
+        };
+        let active_targets = build_targets(&active, &options());
+        assert_eq!(active_targets.len(), 1);
+        assert_eq!(active_targets[0].target_type, "ACTIVE_SIGNAL_RESULT");
+        assert_eq!(active_targets[0].window_semantics, "ordinal");
+        assert_eq!(
+            active_targets[0].active_signal_id.as_deref(),
+            Some("active")
+        );
+        assert!(active_targets[0].passive_signal_id.is_none());
+        assert!(active_targets[0].backfill.is_none());
+    }
+
+    #[test]
+    fn websocket_protocols_include_optional_client_id() {
+        assert_eq!(build_protocols("key", None), vec!["apiKey-key"]);
+        assert_eq!(
+            build_protocols("key", Some("client")),
+            vec!["apiKey-key", "clientId-client"]
+        );
+    }
+
+    #[test]
+    fn decode_expanded_data_backfill_control_and_error_events() {
+        let data = decode_value(json!({
+            "type": "DATA",
+            "streamKey": "PASSIVE_SIGNAL_RESULT:id",
+            "sequence": 2,
+            "payloadType": "value",
+            "emittedAtEpochMs": 100,
+        }))
+        .expect("decode data")
+        .expect("data event");
+        assert!(data.is_data_event());
+        assert!(!data.is_control_event());
+        assert!(!data.is_status_stream());
+        assert_eq!(data.as_json()["payload"], Value::Null);
+        assert!(data.pretty_line().contains("seq=2"));
+
+        let backfill = decode_value(json!({
+            "type": "BACKFILL",
+            "streamKey": "ACTIVE_SIGNAL_STATUS:id",
+            "items": [{"value": 1}],
+            "meta": {"count": 1},
+        }))
+        .expect("decode backfill")
+        .expect("backfill event");
+        assert!(backfill.is_data_event());
+        assert!(backfill.is_status_stream());
+        assert!(backfill.pretty_line().contains("items=1"));
+        assert!(backfill.pretty_line().contains("meta="));
+
+        let empty_backfill = decode_value(json!({
+            "type": "BACKFILL",
+            "streamKey": "PASSIVE_SIGNAL_RESULT:id",
+            "items": "invalid",
+        }))
+        .expect("decode empty backfill")
+        .expect("backfill event");
+        assert!(empty_backfill.pretty_line().contains("items=0"));
+
+        let control = decode_value(json!({
+            "type": "SUBSCRIBED",
+            "streamKey": "PASSIVE_SIGNAL_STATUS:id",
+        }))
+        .expect("decode control")
+        .expect("control event");
+        assert!(control.is_control_event());
+        assert!(control.is_status_stream());
+        assert_eq!(
+            control.pretty_line(),
+            "{\"streamKey\":\"PASSIVE_SIGNAL_STATUS:id\",\"type\":\"SUBSCRIBED\"}"
+        );
+
+        let error = decode_value(json!({
+            "type": "ERROR",
+            "code": "DENIED",
+            "message": "not allowed",
+        }))
+        .expect_err("server error");
+        assert_eq!(error.to_string(), "[DENIED] not allowed");
+
+        let unknown_error =
+            decode_value(json!({"type": "ERROR"})).expect_err("unknown server error");
+        assert_eq!(unknown_error.to_string(), "[unknown] unknown server error");
+    }
+
+    #[test]
+    fn decode_value_ignores_non_events_and_validates_required_fields() {
+        assert!(decode_value(json!(7)).expect("scalar").is_none());
+        assert!(decode_value(json!({})).expect("missing type").is_none());
+
+        for (value, expected) in [
+            (
+                json!({
+                    "type": "DATA",
+                    "sequence": 1,
+                    "payloadType": "value",
+                    "emittedAtEpochMs": 2,
+                }),
+                "streamKey",
+            ),
+            (
+                json!({
+                    "type": "DATA",
+                    "streamKey": "result",
+                    "sequence": "invalid",
+                    "payloadType": "value",
+                    "emittedAtEpochMs": 2,
+                }),
+                "sequence",
+            ),
+            (
+                json!({
+                    "type": "DATA",
+                    "streamKey": "result",
+                    "sequence": 1,
+                    "emittedAtEpochMs": 2,
+                }),
+                "payloadType",
+            ),
+            (
+                json!({
+                    "type": "DATA",
+                    "streamKey": "result",
+                    "sequence": 1,
+                    "payloadType": "value",
+                }),
+                "emittedAtEpochMs",
+            ),
+        ] {
+            let error = decode_value(value).expect_err("invalid data");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn decode_message_handles_all_websocket_frame_types() {
+        let binary = rmp_serde::to_vec_named(&json!({
+            "type": "SUBSCRIBED"
+        }))
+        .expect("messagepack");
+        assert!(
+            decode_message(Message::Binary(binary.into()))
+                .expect("binary")
+                .is_some()
+        );
+        assert!(
+            decode_message(Message::Text("{\"type\":\"SUBSCRIBED\"}".into()))
+                .expect("text")
+                .is_some()
+        );
+        assert!(
+            decode_message(Message::Ping(Vec::new().into()))
+                .expect("ping")
+                .is_none()
+        );
+        assert!(
+            decode_message(Message::Pong(Vec::new().into()))
+                .expect("pong")
+                .is_none()
+        );
+        assert!(
+            decode_message(Message::Close(None))
+                .expect("close")
+                .is_none()
+        );
+        assert!(
+            decode_message(Message::Frame(Frame::message(
+                Vec::new(),
+                OpCode::Data(Data::Text),
+                true,
+            )))
+            .expect("frame")
+            .is_none()
+        );
+        assert!(
+            decode_message(Message::Binary(vec![0x81].into()))
+                .expect_err("invalid messagepack")
+                .to_string()
+                .contains("MessagePack")
+        );
+        assert!(
+            decode_message(Message::Text("{".into()))
+                .expect_err("invalid json")
+                .to_string()
+                .contains("text websocket")
+        );
+    }
+
+    #[test]
+    fn next_message_reports_close_skip_finish_and_errors() {
+        let seen = Cell::new(0);
+        let mut callback = |event: InboundEvent| {
+            assert!(event.is_control_event());
+            seen.set(seen.get() + 1);
+            Ok(true)
+        };
+
+        assert_eq!(
+            handle_next_message(None, &mut callback).expect("closed"),
+            (true, false)
+        );
+        assert_eq!(
+            handle_next_message(Some(Ok(Message::Ping(Vec::new().into()))), &mut callback,)
+                .expect("ping"),
+            (false, false)
+        );
+        assert_eq!(
+            handle_next_message(
+                Some(Ok(Message::Text("{\"type\":\"READY\"}".into()))),
+                &mut callback,
+            )
+            .expect("event"),
+            (false, true)
+        );
+        assert_eq!(seen.get(), 1);
+
+        let error = handle_next_message(Some(Err(Error::ConnectionClosed)), &mut callback)
+            .expect_err("read failure");
+        assert!(error.to_string().contains("message read failed"));
     }
 }
