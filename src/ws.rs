@@ -472,8 +472,13 @@ mod tests {
     use std::cell::Cell;
 
     use serde_json::json;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::{
         Error,
+        handshake::server::{Request, Response},
+        http::{HeaderValue, header::SEC_WEBSOCKET_PROTOCOL},
         protocol::{
             Message,
             frame::{
@@ -500,6 +505,36 @@ mod tests {
             timeout: None,
             no_reconnect: true,
         }
+    }
+
+    async fn websocket_listener() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket");
+        let address = listener.local_addr().expect("websocket address");
+        (listener, format!("ws://{address}"))
+    }
+
+    async fn accept_websocket(stream: TcpStream) -> WebSocketStream<TcpStream> {
+        tokio_tungstenite::accept_hdr_async(stream, |request: &Request, mut response: Response| {
+            let protocol = request
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .expect("requested websocket protocol")
+                .to_str()
+                .expect("valid websocket protocol")
+                .split(',')
+                .next()
+                .expect("at least one websocket protocol")
+                .trim();
+            response.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_str(protocol).expect("valid selected websocket protocol"),
+            );
+            Ok(response)
+        })
+        .await
+        .expect("websocket handshake")
     }
 
     #[test]
@@ -782,5 +817,193 @@ mod tests {
         let error = handle_next_message(Some(Err(Error::ConnectionClosed)), &mut callback)
             .expect_err("read failure");
         assert!(error.to_string().contains("message read failed"));
+    }
+
+    #[tokio::test]
+    async fn subscription_sends_payload_and_finishes_on_callback() {
+        let (listener, ws_url) = websocket_listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut websocket = accept_websocket(stream).await;
+            let payload = websocket
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            let Message::Binary(payload) = payload else {
+                panic!("expected binary subscribe payload");
+            };
+            let decoded: Value = rmp_serde::from_slice(&payload).expect("subscribe payload");
+            assert_eq!(decoded["actionType"], "SUBSCRIBE");
+            assert_eq!(decoded["targets"][0]["passiveSignalId"], "passive");
+            websocket
+                .send(Message::Text("{\"type\":\"SUBSCRIBED\"}".into()))
+                .await
+                .expect("send event");
+        });
+        let spec = SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "passive".to_owned(),
+        };
+        let mut seen = 0;
+
+        run_subscription(
+            &ws_url,
+            "key",
+            Some("client"),
+            &spec,
+            &options(),
+            false,
+            |event| {
+                assert!(event.is_control_event());
+                seen += 1;
+                Ok(true)
+            },
+        )
+        .await
+        .expect("subscription");
+
+        assert_eq!(seen, 1);
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn subscription_timeout_works_with_and_without_signal_capture() {
+        for capture_ctrl_c in [false, true] {
+            let (listener, ws_url) = websocket_listener().await;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut websocket = accept_websocket(stream).await;
+                let _ = websocket.next().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            let spec = SubscriptionSpec {
+                kind: SubscriptionKind::Active,
+                signal_id: "active".to_owned(),
+            };
+            let mut timeout_options = options();
+            timeout_options.timeout = Some(Duration::from_millis(10));
+
+            timeout(
+                Duration::from_secs(1),
+                run_subscription(
+                    &ws_url,
+                    "key",
+                    None,
+                    &spec,
+                    &timeout_options,
+                    capture_ctrl_c,
+                    |_event| Ok(false),
+                ),
+            )
+            .await
+            .expect("subscription timeout bound")
+            .expect("subscription timeout");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_stops_after_close_when_reconnect_is_disabled() {
+        let (listener, ws_url) = websocket_listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut websocket = accept_websocket(stream).await;
+            let _ = websocket.next().await;
+            websocket.close(None).await.expect("close");
+        });
+        let spec = SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "passive".to_owned(),
+        };
+
+        run_subscription(&ws_url, "key", None, &spec, &options(), false, |_event| {
+            Ok(false)
+        })
+        .await
+        .expect("closed subscription");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn subscription_reconnects_after_server_close() {
+        let (listener, ws_url) = websocket_listener().await;
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("first accept");
+            let mut first = accept_websocket(first_stream).await;
+            let _ = first.next().await;
+            first.send(Message::Close(None)).await.expect("first close");
+            drop(first);
+
+            let (second_stream, _) = listener.accept().await.expect("second accept");
+            let mut second = accept_websocket(second_stream).await;
+            let _ = second.next().await;
+            second
+                .send(Message::Text("{\"type\":\"READY\"}".into()))
+                .await
+                .expect("send ready");
+        });
+        let spec = SubscriptionSpec {
+            kind: SubscriptionKind::Active,
+            signal_id: "active".to_owned(),
+        };
+        let mut reconnect_options = options();
+        reconnect_options.no_reconnect = false;
+
+        timeout(
+            Duration::from_secs(3),
+            run_subscription(
+                &ws_url,
+                "key",
+                None,
+                &spec,
+                &reconnect_options,
+                false,
+                |_event| Ok(true),
+            ),
+        )
+        .await
+        .expect("reconnect bound")
+        .expect("reconnect subscription");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn subscription_reports_url_connection_and_callback_errors() {
+        let spec = SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "passive".to_owned(),
+        };
+        let error = run_subscription(
+            "not a websocket url",
+            "key",
+            None,
+            &spec,
+            &options(),
+            false,
+            |_event| Ok(false),
+        )
+        .await
+        .expect_err("invalid websocket url");
+        assert!(error.to_string().contains("websocket request"));
+
+        let (listener, ws_url) = websocket_listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut websocket = accept_websocket(stream).await;
+            let _ = websocket.next().await;
+            websocket
+                .send(Message::Text("{\"type\":\"READY\"}".into()))
+                .await
+                .expect("event");
+        });
+        let callback_error =
+            run_subscription(&ws_url, "key", None, &spec, &options(), false, |_event| {
+                Err(anyhow::anyhow!("callback failed"))
+            })
+            .await
+            .expect_err("callback failure");
+        assert_eq!(callback_error.to_string(), "callback failed");
+        server.await.expect("server");
     }
 }

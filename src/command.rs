@@ -30,6 +30,10 @@ struct ReconcileSubscriptionContext<'a> {
 
 pub async fn run(cli: Cli) -> Result<()> {
     let store = ConfigStore::discover()?;
+    run_with_store(cli, &store).await
+}
+
+async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<()> {
     let api_key = cli.api_key.clone();
     let http_base_url = cli.http_base_url.clone();
     let ws_url = cli.ws_url.clone();
@@ -37,11 +41,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         RootCommand::Auth(command) => {
-            run_auth(command, api_key, http_base_url, ws_url, client_id, &store).await
+            run_auth(command, api_key, http_base_url, ws_url, client_id, store).await
         }
-        RootCommand::Config(command) => run_config(command, &store),
+        RootCommand::Config(command) => run_config(command, store),
         RootCommand::Signals(command) => {
-            run_signals(command, api_key, http_base_url, ws_url, client_id, &store).await
+            run_signals(command, api_key, http_base_url, ws_url, client_id, store).await
         }
     }
 }
@@ -690,7 +694,16 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::Value;
+    use tokio::net::{TcpListener as AsyncTcpListener, TcpStream};
+    use tokio::task::JoinHandle as TokioJoinHandle;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::{
+        handshake::server::{Request, Response},
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        protocol::Message,
+    };
 
     use crate::cli::{
         ActiveSignalsCommand, JsonOutputFormat, ListOutputFormat, StreamOutputFilter,
@@ -737,6 +750,64 @@ mod tests {
             stream.write_all(response.as_bytes()).expect("respond");
         });
         (format!("http://{address}"), receiver)
+    }
+
+    async fn accept_websocket(stream: TcpStream) -> WebSocketStream<TcpStream> {
+        tokio_tungstenite::accept_hdr_async(stream, |request: &Request, mut response: Response| {
+            let protocol = request
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .expect("requested protocol")
+                .to_str()
+                .expect("valid requested protocol")
+                .split(',')
+                .next()
+                .expect("at least one protocol")
+                .trim();
+            response.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                protocol.parse().expect("valid selected protocol"),
+            );
+            Ok(response)
+        })
+        .await
+        .expect("websocket handshake")
+    }
+
+    async fn spawn_websocket_event() -> (String, TokioJoinHandle<()>) {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket");
+        let address = listener.local_addr().expect("websocket address");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = accept_websocket(stream).await;
+            let subscribe = websocket.next().await.expect("subscribe").expect("frame");
+            assert!(matches!(subscribe, Message::Binary(_)));
+            websocket
+                .send(Message::Text(
+                    r#"{"sk":"PASSIVE_SIGNAL:signal:ordinal","sq":1,"k":"psr","at":1,"p":{"value":7}}"#
+                        .into(),
+                ))
+                .await
+                .expect("send event");
+        });
+        (format!("ws://{address}"), task)
+    }
+
+    fn stream_options_once() -> StreamOptions {
+        StreamOptions {
+            output: StreamOutputFilter::Data,
+            window_semantics: WindowSemantics::Ordinal,
+            backfill: false,
+            backfill_from: None,
+            backfill_to: None,
+            backfill_count: None,
+            include_status: false,
+            once: true,
+            timeout: Some(Duration::from_secs(1)),
+            no_reconnect: true,
+        }
     }
 
     #[test]
@@ -909,6 +980,168 @@ mod tests {
                     .starts_with(&format!("GET {expected_path} "))
             );
         }
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn stream_and_tail_commands_write_websocket_events() {
+        let store = test_store("stream-output");
+        std::fs::create_dir_all(store.root_dir()).expect("create output directory");
+        let destination = store.root_dir().join("events.ndjson");
+        let (ws_url, server) = spawn_websocket_event().await;
+        let stream = StreamCommand {
+            signal_id: "signal".to_owned(),
+            options: stream_options_once(),
+            format: StreamOutputFormat::Ndjson,
+            destination: Some(destination.clone()),
+        };
+
+        run_stream_command(
+            SubscriptionKind::Passive,
+            &ws_url,
+            "key",
+            Some("client"),
+            &stream,
+        )
+        .await
+        .expect("stream command");
+        server.await.expect("stream server");
+        assert!(
+            std::fs::read_to_string(&destination)
+                .expect("stream output")
+                .contains("\"streamKey\":\"PASSIVE_SIGNAL:signal:ordinal\"")
+        );
+
+        let (ws_url, server) = spawn_websocket_event().await;
+        let tail = TailCommand {
+            signal_id: "signal".to_owned(),
+            output: StreamOutputFilter::All,
+            window_semantics: WindowSemantics::Ordinal,
+            backfill: false,
+            backfill_from: None,
+            backfill_to: None,
+            backfill_count: None,
+            include_status: false,
+            once: true,
+            timeout: Some(Duration::from_secs(1)),
+            no_reconnect: true,
+            format: StreamOutputFormat::Pretty,
+        };
+        run_tail_command(SubscriptionKind::Active, &ws_url, "key", None, &tail)
+            .await
+            .expect("tail command");
+        server.await.expect("tail server");
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn signal_subscription_routes_cover_passive_and_active_variants() {
+        let store = test_store("signal-subscriptions");
+
+        for is_active in [false, true] {
+            let (ws_url, server) = spawn_websocket_event().await;
+            let stream = StreamCommand {
+                signal_id: "signal".to_owned(),
+                options: stream_options_once(),
+                format: StreamOutputFormat::Json,
+                destination: None,
+            };
+            let command = if is_active {
+                SignalsCommand::Active(ActiveSignalsCommand::Subscribe(stream))
+            } else {
+                SignalsCommand::Passive(PassiveSignalsCommand::Subscribe(stream))
+            };
+            run_signals(
+                command,
+                Some("key".to_owned()),
+                Some("http://unused".to_owned()),
+                Some(ws_url),
+                None,
+                &store,
+            )
+            .await
+            .expect("subscribe route");
+            server.await.expect("subscribe server");
+
+            let (ws_url, server) = spawn_websocket_event().await;
+            let tail = TailCommand {
+                signal_id: "signal".to_owned(),
+                output: StreamOutputFilter::All,
+                window_semantics: WindowSemantics::Ordinal,
+                backfill: false,
+                backfill_from: None,
+                backfill_to: None,
+                backfill_count: None,
+                include_status: false,
+                once: true,
+                timeout: Some(Duration::from_secs(1)),
+                no_reconnect: true,
+                format: StreamOutputFormat::Ndjson,
+            };
+            let command = if is_active {
+                SignalsCommand::Active(ActiveSignalsCommand::Tail(tail))
+            } else {
+                SignalsCommand::Passive(PassiveSignalsCommand::Tail(tail))
+            };
+            run_signals(
+                command,
+                Some("key".to_owned()),
+                Some("http://unused".to_owned()),
+                Some(ws_url),
+                None,
+                &store,
+            )
+            .await
+            .expect("tail route");
+            server.await.expect("tail server");
+        }
+        cleanup(&store);
+    }
+
+    #[tokio::test]
+    async fn root_dispatch_uses_the_supplied_config_store() {
+        let store = test_store("root-dispatch");
+        let config_cli = Cli {
+            api_key: None,
+            http_base_url: None,
+            ws_url: None,
+            client_id: None,
+            command: RootCommand::Config(ConfigCommand::Reset),
+        };
+        run_with_store(config_cli, &store)
+            .await
+            .expect("config dispatch");
+
+        let auth_cli = Cli {
+            api_key: None,
+            http_base_url: None,
+            ws_url: None,
+            client_id: None,
+            command: RootCommand::Auth(AuthCommand::Clear),
+        };
+        run_with_store(auth_cli, &store)
+            .await
+            .expect("auth dispatch");
+
+        let (base_url, request) = spawn_server("200 OK", r#"{"passiveSignals":[]}"#);
+        let signals_cli = Cli {
+            api_key: Some("key".to_owned()),
+            http_base_url: Some(base_url),
+            ws_url: Some("ws://unused".to_owned()),
+            client_id: Some("client".to_owned()),
+            command: RootCommand::Signals(SignalsCommand::Passive(PassiveSignalsCommand::List {
+                format: ListOutputFormat::Table,
+            })),
+        };
+        run_with_store(signals_cli, &store)
+            .await
+            .expect("signals dispatch");
+        assert!(
+            request
+                .recv()
+                .expect("signals request")
+                .starts_with("GET /passive-signals ")
+        );
         cleanup(&store);
     }
 
