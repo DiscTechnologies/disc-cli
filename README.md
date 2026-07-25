@@ -206,6 +206,12 @@ Run:
 cargo run --bin disc -- --help
 ```
 
+Run the test suite with the enforced 98% line and function coverage thresholds:
+
+```bash
+rustup run stable cargo coverage
+```
+
 ### Local wrapper
 
 ```bash
@@ -257,4 +263,3 @@ Artifacts:
 ## License
 
 See `LICENSE`.
-
