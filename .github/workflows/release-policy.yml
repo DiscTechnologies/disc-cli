@@ -1,0 +1,33 @@
+name: release-policy
+
+on:
+  push:
+    tags:
+      - "**"
+  release:
+    types:
+      - published
+      - edited
+      - prereleased
+      - released
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_NAME: ${{ github.event.release.name }}
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+    steps:
+      - name: Validate canonical release metadata
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$ ]]; then
+            echo "::error::Release tag must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N"
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "release" && "${RELEASE_NAME}" != "${RELEASE_TAG}" ]]; then
+            echo "::error::GitHub Release title must exactly match its tag"
+            exit 1
+          fi
