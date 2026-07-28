@@ -30,6 +30,10 @@ struct ReconcileSubscriptionContext<'a> {
 
 pub async fn run(cli: Cli) -> Result<()> {
     let store = ConfigStore::discover()?;
+    run_with_store(cli, &store).await
+}
+
+async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<()> {
     let api_key = cli.api_key.clone();
     let http_base_url = cli.http_base_url.clone();
     let ws_url = cli.ws_url.clone();
@@ -37,11 +41,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         RootCommand::Auth(command) => {
-            run_auth(command, api_key, http_base_url, ws_url, client_id, &store).await
+            run_auth(command, api_key, http_base_url, ws_url, client_id, store).await
         }
-        RootCommand::Config(command) => run_config(command, &store),
+        RootCommand::Config(command) => run_config(command, store),
         RootCommand::Signals(command) => {
-            run_signals(command, api_key, http_base_url, ws_url, client_id, &store).await
+            run_signals(command, api_key, http_base_url, ws_url, client_id, store).await
         }
     }
 }
@@ -561,14 +565,7 @@ fn prompt_passive_signal_selection(
     passive_signals: &[PassiveSignalSummary],
     selected_passive_ids: &HashSet<String>,
 ) -> Result<HashSet<String>> {
-    let labels = passive_signals
-        .iter()
-        .map(|signal| format!("{} ({})", signal.label, signal.passive_signal_id))
-        .collect::<Vec<_>>();
-    let defaults = passive_signals
-        .iter()
-        .map(|signal| selected_passive_ids.contains(&signal.passive_signal_id))
-        .collect::<Vec<_>>();
+    let (labels, defaults) = passive_selection_options(passive_signals, selected_passive_ids);
 
     let selection = MultiSelect::with_theme(theme)
         .with_prompt("Toggle passive signal subscriptions")
@@ -577,12 +574,32 @@ fn prompt_passive_signal_selection(
         .interact()
         .context("Failed to select passive signals.")?;
 
-    let next_selected = selection
+    Ok(selected_passive_signal_ids(passive_signals, selection))
+}
+
+fn passive_selection_options(
+    passive_signals: &[PassiveSignalSummary],
+    selected_passive_ids: &HashSet<String>,
+) -> (Vec<String>, Vec<bool>) {
+    let labels = passive_signals
+        .iter()
+        .map(|signal| format!("{} ({})", signal.label, signal.passive_signal_id))
+        .collect::<Vec<_>>();
+    let defaults = passive_signals
+        .iter()
+        .map(|signal| selected_passive_ids.contains(&signal.passive_signal_id))
+        .collect::<Vec<_>>();
+    (labels, defaults)
+}
+
+fn selected_passive_signal_ids(
+    passive_signals: &[PassiveSignalSummary],
+    selection: Vec<usize>,
+) -> HashSet<String> {
+    selection
         .into_iter()
         .map(|index| passive_signals[index].passive_signal_id.clone())
-        .collect::<HashSet<_>>();
-
-    Ok(next_selected)
+        .collect()
 }
 
 fn prompt_passive_parent(
@@ -609,14 +626,7 @@ fn prompt_active_signal_selection(
     active_signals: &[ActiveSignalSummary],
     selected_active_ids: &HashSet<String>,
 ) -> Result<HashSet<String>> {
-    let labels = active_signals
-        .iter()
-        .map(|signal| format!("{} ({})", signal.label, signal.active_signal_id))
-        .collect::<Vec<_>>();
-    let defaults = active_signals
-        .iter()
-        .map(|signal| selected_active_ids.contains(&signal.active_signal_id))
-        .collect::<Vec<_>>();
+    let (labels, defaults) = active_selection_options(active_signals, selected_active_ids);
 
     let selection = MultiSelect::with_theme(theme)
         .with_prompt("Toggle active signal subscriptions")
@@ -625,6 +635,33 @@ fn prompt_active_signal_selection(
         .interact()
         .context("Failed to select active signals.")?;
 
+    Ok(merge_active_signal_selection(
+        active_signals,
+        selected_active_ids,
+        selection,
+    ))
+}
+
+fn active_selection_options(
+    active_signals: &[ActiveSignalSummary],
+    selected_active_ids: &HashSet<String>,
+) -> (Vec<String>, Vec<bool>) {
+    let labels = active_signals
+        .iter()
+        .map(|signal| format!("{} ({})", signal.label, signal.active_signal_id))
+        .collect::<Vec<_>>();
+    let defaults = active_signals
+        .iter()
+        .map(|signal| selected_active_ids.contains(&signal.active_signal_id))
+        .collect::<Vec<_>>();
+    (labels, defaults)
+}
+
+fn merge_active_signal_selection(
+    active_signals: &[ActiveSignalSummary],
+    selected_active_ids: &HashSet<String>,
+    selection: Vec<usize>,
+) -> HashSet<String> {
     let mut next_selected = selected_active_ids.clone();
     next_selected.retain(|signal_id| {
         active_signals
@@ -634,8 +671,7 @@ fn prompt_active_signal_selection(
     for index in selection {
         next_selected.insert(active_signals[index].active_signal_id.clone());
     }
-
-    Ok(next_selected)
+    next_selected
 }
 
 fn resolve_api_key_input(value: Option<String>, stdin: bool) -> Result<String> {
@@ -680,4 +716,704 @@ fn validate_api_key(raw_value: String) -> Result<String> {
     }
 
     Ok(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener as TokioTcpListener;
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    use crate::cli::{
+        ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand, JsonOutputFormat,
+        ListOutputFormat, PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand,
+        StreamOptions, StreamOutputFilter, StreamOutputFormat, TailCommand, WindowSemantics,
+    };
+    use crate::config::{ConfigStore, StoredConfig};
+    use crate::http::{ActiveSignalSummary, PassiveSignalSummary};
+    use crate::output::SharedWriter;
+    use crate::ws::{SubscriptionKind, SubscriptionSpec};
+
+    use super::{
+        ReconcileSubscriptionContext, abort_all_tasks, active_selection_options,
+        merge_active_signal_selection, passive_selection_options, print_subscription_summary,
+        reconcile_subscriptions, resolve_api_key_input, run_auth, run_config, run_signals,
+        run_with_store, selected_passive_signal_ids, stream_options_from_tail,
+        strip_ansi_sequences, validate_api_key,
+    };
+
+    fn temporary_root(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "disc-cli-command-{test_name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn stream_options() -> StreamOptions {
+        StreamOptions {
+            output: StreamOutputFilter::Data,
+            window_semantics: WindowSemantics::Ordinal,
+            backfill: false,
+            backfill_from: None,
+            backfill_to: None,
+            backfill_count: None,
+            include_status: false,
+            once: false,
+            timeout: Some(Duration::from_millis(1)),
+            no_reconnect: true,
+        }
+    }
+
+    fn serve_once(body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        let address = listener.local_addr().expect("server address");
+        let body = body.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    async fn serve_websocket_data_once() -> (String, JoinHandle<()>) {
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let mut socket =
+                accept_hdr_async(stream, |_request: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        "apiKey-test-key".parse().expect("protocol response"),
+                    );
+                    Ok(response)
+                })
+                .await
+                .expect("accept WebSocket");
+            socket
+                .next()
+                .await
+                .expect("subscription frame")
+                .expect("valid subscription");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "DATA",
+                        "streamKey": "PASSIVE_SIGNAL:signal-one:ordinal",
+                        "sequence": 1,
+                        "payloadType": "result",
+                        "emittedAtEpochMs": 100,
+                        "payload": {"value": 42}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send data event");
+            let _ = socket.close(None).await;
+        });
+        (format!("ws://{address}"), server)
+    }
+
+    #[test]
+    fn api_key_validation_strips_terminal_sequences_and_rejects_blank_values() {
+        assert_eq!(strip_ansi_sequences("\u{1b}[32msecret\u{1b}[0m"), "secret");
+        assert_eq!(
+            validate_api_key("  \u{1b}[32msecret\u{1b}[0m\n".to_owned()).expect("valid key"),
+            "secret"
+        );
+        assert!(
+            validate_api_key(" \n\t ".to_owned())
+                .expect_err("blank key")
+                .to_string()
+                .contains("cannot be empty")
+        );
+        assert_eq!(
+            resolve_api_key_input(Some(" direct-key ".to_owned()), false).expect("direct API key"),
+            "direct-key"
+        );
+    }
+
+    #[test]
+    fn config_commands_persist_update_and_reset_values() {
+        let root = temporary_root("config");
+        let store = ConfigStore::at_root(root.clone());
+
+        run_config(ConfigCommand::Show, &store).expect("show defaults");
+        run_config(
+            ConfigCommand::Set {
+                http_base_url: Some("https://api.example.test".to_owned()),
+                ws_url: Some("wss://signals.example.test".to_owned()),
+                client_id: Some("client-one".to_owned()),
+            },
+            &store,
+        )
+        .expect("set config");
+        let stored = store.load_config().expect("load config");
+        assert_eq!(
+            stored.http_base_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(stored.ws_url.as_deref(), Some("wss://signals.example.test"));
+        assert_eq!(stored.client_id.as_deref(), Some("client-one"));
+        run_config(ConfigCommand::Show, &store).expect("show stored config");
+
+        run_config(
+            ConfigCommand::Set {
+                http_base_url: None,
+                ws_url: Some("wss://changed.example.test".to_owned()),
+                client_id: None,
+            },
+            &store,
+        )
+        .expect("partially update config");
+        let stored = store.load_config().expect("load updated config");
+        assert_eq!(
+            stored.http_base_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(stored.ws_url.as_deref(), Some("wss://changed.example.test"));
+
+        run_config(ConfigCommand::Reset, &store).expect("reset config");
+        let reset = store.load_config().expect("load reset config");
+        assert!(reset.http_base_url.is_none());
+        assert!(reset.ws_url.is_none());
+        assert!(reset.client_id.is_none());
+        fs::remove_dir_all(root).expect("remove config root");
+    }
+
+    #[tokio::test]
+    async fn auth_set_and_clear_commands_manage_credentials_and_endpoint_options() {
+        let root = temporary_root("auth");
+        let store = ConfigStore::at_root(root.clone());
+
+        run_auth(
+            AuthCommand::ApiKey(ApiKeyCommand::Set {
+                value: Some(" secret ".to_owned()),
+                stdin: false,
+            }),
+            None,
+            Some("https://api.example.test".to_owned()),
+            Some("wss://signals.example.test".to_owned()),
+            Some("client-one".to_owned()),
+            &store,
+        )
+        .await
+        .expect("set auth");
+        assert_eq!(
+            store
+                .load_auth()
+                .expect("load auth")
+                .expect("stored auth")
+                .api_key,
+            "secret"
+        );
+        let config = store.load_config().expect("load endpoint config");
+        assert_eq!(
+            config.http_base_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(config.ws_url.as_deref(), Some("wss://signals.example.test"));
+        assert_eq!(config.client_id.as_deref(), Some("client-one"));
+
+        run_auth(AuthCommand::Clear, None, None, None, None, &store)
+            .await
+            .expect("clear stored auth");
+        assert!(store.load_auth().expect("load cleared auth").is_none());
+        run_auth(AuthCommand::Clear, None, None, None, None, &store)
+            .await
+            .expect("clear absent auth");
+        fs::remove_dir_all(root).expect("remove auth root");
+    }
+
+    #[tokio::test]
+    async fn root_dispatcher_routes_config_auth_and_signal_commands() {
+        let root = temporary_root("root-dispatch");
+        let store = ConfigStore::at_root(root.clone());
+        run_with_store(
+            Cli {
+                api_key: None,
+                http_base_url: None,
+                ws_url: None,
+                client_id: None,
+                command: RootCommand::Config(ConfigCommand::Show),
+            },
+            &store,
+        )
+        .await
+        .expect("dispatch config");
+        run_with_store(
+            Cli {
+                api_key: None,
+                http_base_url: None,
+                ws_url: None,
+                client_id: None,
+                command: RootCommand::Auth(AuthCommand::Clear),
+            },
+            &store,
+        )
+        .await
+        .expect("dispatch auth");
+
+        let body = serde_json::json!({
+            "passiveSignals": [{
+                "passiveSignalId": "passive-one",
+                "label": "Revenue"
+            }]
+        })
+        .to_string();
+        run_with_store(
+            Cli {
+                api_key: Some("test-key".to_owned()),
+                http_base_url: Some(serve_once(&body)),
+                ws_url: None,
+                client_id: Some("client-one".to_owned()),
+                command: RootCommand::Signals(SignalsCommand::Passive(
+                    PassiveSignalsCommand::List {
+                        format: ListOutputFormat::Json,
+                    },
+                )),
+            },
+            &store,
+        )
+        .await
+        .expect("dispatch signals");
+        if root.exists() {
+            fs::remove_dir_all(root).expect("remove dispatch root");
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_command_validates_and_renders_both_json_formats() {
+        let root = temporary_root("whoami");
+        let store = ConfigStore::at_root(root.clone());
+        let body = serde_json::json!({
+            "authType": "API_KEY",
+            "authTokenId": "token-one",
+            "sessionId": null,
+            "apiKeyId": "key-one",
+            "userId": "user-one",
+            "userType": "SUBJECT",
+            "expiresAt": null,
+            "revalidateAt": "2026-07-28T12:00:00Z"
+        })
+        .to_string();
+
+        for format in [JsonOutputFormat::Json, JsonOutputFormat::Ndjson] {
+            run_auth(
+                AuthCommand::Whoami { format },
+                Some("test-key".to_owned()),
+                Some(serve_once(&body)),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect("whoami command");
+        }
+        if root.exists() {
+            fs::remove_dir_all(root).expect("remove whoami root");
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_list_and_get_commands_cover_passive_and_active_routes() {
+        let root = temporary_root("signals");
+        let store = ConfigStore::at_root(root.clone());
+        let passive_list = serde_json::json!({
+            "passiveSignals": [{
+                "passiveSignalId": "passive-one",
+                "label": "Revenue",
+                "status": "active"
+            }]
+        })
+        .to_string();
+        for format in [
+            ListOutputFormat::Json,
+            ListOutputFormat::Ndjson,
+            ListOutputFormat::Table,
+        ] {
+            run_signals(
+                SignalsCommand::Passive(PassiveSignalsCommand::List { format }),
+                Some("test-key".to_owned()),
+                Some(serve_once(&passive_list)),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect("passive list");
+        }
+
+        for format in [JsonOutputFormat::Json, JsonOutputFormat::Ndjson] {
+            run_signals(
+                SignalsCommand::Passive(PassiveSignalsCommand::Get {
+                    passive_signal_id: "passive-one".to_owned(),
+                    format,
+                }),
+                Some("test-key".to_owned()),
+                Some(serve_once(
+                    r#"{"passiveSignalId":"passive-one","label":"Revenue"}"#,
+                )),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect("passive get");
+        }
+
+        let active_list = serde_json::json!({
+            "activeSignals": [{
+                "activeSignalId": "active-one",
+                "passiveSignalId": "passive-one",
+                "label": "Revenue average",
+                "isPaused": true
+            }]
+        })
+        .to_string();
+        for format in [
+            ListOutputFormat::Json,
+            ListOutputFormat::Ndjson,
+            ListOutputFormat::Table,
+        ] {
+            run_signals(
+                SignalsCommand::Active(ActiveSignalsCommand::List {
+                    passive_signal_id: "passive-one".to_owned(),
+                    format,
+                }),
+                Some("test-key".to_owned()),
+                Some(serve_once(&active_list)),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect("active list");
+        }
+
+        for format in [JsonOutputFormat::Json, JsonOutputFormat::Ndjson] {
+            run_signals(
+                SignalsCommand::Active(ActiveSignalsCommand::Get {
+                    active_signal_id: "active-one".to_owned(),
+                    format,
+                }),
+                Some("test-key".to_owned()),
+                Some(serve_once(
+                    r#"{"activeSignalId":"active-one","label":"Revenue average"}"#,
+                )),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect("active get");
+        }
+        if root.exists() {
+            fs::remove_dir_all(root).expect("remove signals root");
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_and_tail_commands_dispatch_passive_and_active_streams() {
+        let root = temporary_root("stream-commands");
+        let store = ConfigStore::at_root(root.clone());
+        let destination = root.join("events.ndjson");
+        fs::create_dir_all(&root).expect("create stream command root");
+        let mut options = stream_options();
+        options.once = true;
+        options.timeout = Some(Duration::from_secs(1));
+
+        for kind in [SubscriptionKind::Passive, SubscriptionKind::Active] {
+            let (ws_url, server) = serve_websocket_data_once().await;
+            let command = StreamCommand {
+                signal_id: "signal-one".to_owned(),
+                options: options.clone(),
+                format: StreamOutputFormat::Ndjson,
+                destination: Some(destination.clone()),
+            };
+            let signals_command = match kind {
+                SubscriptionKind::Passive => {
+                    SignalsCommand::Passive(PassiveSignalsCommand::Subscribe(command))
+                }
+                SubscriptionKind::Active => {
+                    SignalsCommand::Active(ActiveSignalsCommand::Subscribe(command))
+                }
+            };
+            run_signals(
+                signals_command,
+                Some("test-key".to_owned()),
+                Some("http://unused.example.test".to_owned()),
+                Some(ws_url),
+                None,
+                &store,
+            )
+            .await
+            .expect("stream command");
+            server.await.expect("WebSocket server");
+        }
+
+        let (ws_url, server) = serve_websocket_data_once().await;
+        let mut filtered_options = options.clone();
+        filtered_options.output = StreamOutputFilter::Status;
+        filtered_options.no_reconnect = true;
+        run_signals(
+            SignalsCommand::Passive(PassiveSignalsCommand::Subscribe(StreamCommand {
+                signal_id: "signal-one".to_owned(),
+                options: filtered_options,
+                format: StreamOutputFormat::Pretty,
+                destination: None,
+            })),
+            Some("test-key".to_owned()),
+            Some("http://unused.example.test".to_owned()),
+            Some(ws_url),
+            None,
+            &store,
+        )
+        .await
+        .expect("filtered stream command");
+        server.await.expect("filtered WebSocket server");
+
+        for kind in [SubscriptionKind::Passive, SubscriptionKind::Active] {
+            let (ws_url, server) = serve_websocket_data_once().await;
+            let command = TailCommand {
+                signal_id: "signal-one".to_owned(),
+                output: StreamOutputFilter::Data,
+                window_semantics: WindowSemantics::Ordinal,
+                backfill: true,
+                backfill_from: None,
+                backfill_to: None,
+                backfill_count: Some(1),
+                include_status: false,
+                once: true,
+                timeout: Some(Duration::from_secs(1)),
+                no_reconnect: true,
+                format: StreamOutputFormat::Pretty,
+            };
+            let signals_command = match kind {
+                SubscriptionKind::Passive => {
+                    SignalsCommand::Passive(PassiveSignalsCommand::Tail(command))
+                }
+                SubscriptionKind::Active => {
+                    SignalsCommand::Active(ActiveSignalsCommand::Tail(command))
+                }
+            };
+            run_signals(
+                signals_command,
+                Some("test-key".to_owned()),
+                Some("http://unused.example.test".to_owned()),
+                Some(ws_url),
+                None,
+                &store,
+            )
+            .await
+            .expect("tail command");
+            server.await.expect("WebSocket server");
+        }
+
+        let lines = fs::read_to_string(&destination).expect("stream destination");
+        assert_eq!(lines.lines().count(), 2);
+        fs::remove_dir_all(root).expect("remove stream command root");
+    }
+
+    #[test]
+    fn tail_options_map_without_dropping_any_subscription_contract() {
+        let command = TailCommand {
+            signal_id: "signal-one".to_owned(),
+            output: StreamOutputFilter::Status,
+            window_semantics: WindowSemantics::Elapsed,
+            backfill: true,
+            backfill_from: Some(10),
+            backfill_to: Some(20),
+            backfill_count: Some(30),
+            include_status: true,
+            once: true,
+            timeout: Some(Duration::from_secs(4)),
+            no_reconnect: true,
+            format: StreamOutputFormat::Json,
+        };
+
+        let options = stream_options_from_tail(&command);
+        assert_eq!(options.output, StreamOutputFilter::Status);
+        assert_eq!(options.window_semantics, WindowSemantics::Elapsed);
+        assert!(options.backfill);
+        assert_eq!(options.backfill_from, Some(10));
+        assert_eq!(options.backfill_to, Some(20));
+        assert_eq!(options.backfill_count, Some(30));
+        assert!(options.include_status);
+        assert!(options.once);
+        assert_eq!(options.timeout, Some(Duration::from_secs(4)));
+        assert!(options.no_reconnect);
+    }
+
+    #[tokio::test]
+    async fn subscription_reconciliation_adds_preserves_and_removes_desired_tasks() {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(io::sink())));
+        let options = stream_options();
+        let mut tasks = HashMap::new();
+        let passive_ids = HashSet::from(["passive-one".to_owned()]);
+        let active_ids = HashSet::from(["active-one".to_owned()]);
+
+        reconcile_subscriptions(
+            &mut tasks,
+            ReconcileSubscriptionContext {
+                writer: &writer,
+                ws_url: "ws://127.0.0.1:1",
+                api_key: "test-key",
+                client_id: Some("client-one"),
+                options: &options,
+                format: StreamOutputFormat::Ndjson,
+            },
+            &passive_ids,
+            &active_ids,
+        );
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.contains_key(&SubscriptionSpec {
+            kind: SubscriptionKind::Passive,
+            signal_id: "passive-one".to_owned(),
+        }));
+        assert!(tasks.contains_key(&SubscriptionSpec {
+            kind: SubscriptionKind::Active,
+            signal_id: "active-one".to_owned(),
+        }));
+
+        reconcile_subscriptions(
+            &mut tasks,
+            ReconcileSubscriptionContext {
+                writer: &writer,
+                ws_url: "ws://127.0.0.1:1",
+                api_key: "test-key",
+                client_id: None,
+                options: &options,
+                format: StreamOutputFormat::Pretty,
+            },
+            &passive_ids,
+            &HashSet::new(),
+        );
+        assert_eq!(tasks.len(), 1);
+
+        abort_all_tasks(&mut tasks);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn subscription_summary_handles_empty_and_selected_signal_sets() {
+        let passive_signals = vec![PassiveSignalSummary {
+            passive_signal_id: "passive-one".to_owned(),
+            label: "Revenue".to_owned(),
+        }];
+        let active_signals = vec![ActiveSignalSummary {
+            active_signal_id: "active-one".to_owned(),
+            passive_signal_id: "passive-one".to_owned(),
+            label: "Revenue average".to_owned(),
+        }];
+        let cache = HashMap::from([("passive-one".to_owned(), active_signals)]);
+        let destination = PathBuf::from("signals.ndjson");
+
+        print_subscription_summary(
+            &passive_signals,
+            &cache,
+            &HashSet::new(),
+            &HashSet::new(),
+            &destination,
+        );
+        print_subscription_summary(
+            &passive_signals,
+            &cache,
+            &HashSet::from(["passive-one".to_owned()]),
+            &HashSet::from(["active-one".to_owned()]),
+            &destination,
+        );
+    }
+
+    #[test]
+    fn selection_models_build_labels_defaults_and_preserve_other_parent_selections() {
+        let passive_signals = vec![
+            PassiveSignalSummary {
+                passive_signal_id: "passive-one".to_owned(),
+                label: "Revenue".to_owned(),
+            },
+            PassiveSignalSummary {
+                passive_signal_id: "passive-two".to_owned(),
+                label: "Cost".to_owned(),
+            },
+        ];
+        let (labels, defaults) =
+            passive_selection_options(&passive_signals, &HashSet::from(["passive-two".to_owned()]));
+        assert_eq!(labels, vec!["Revenue (passive-one)", "Cost (passive-two)"]);
+        assert_eq!(defaults, vec![false, true]);
+        assert_eq!(
+            selected_passive_signal_ids(&passive_signals, vec![0]),
+            HashSet::from(["passive-one".to_owned()])
+        );
+
+        let active_signals = vec![
+            ActiveSignalSummary {
+                active_signal_id: "active-one".to_owned(),
+                passive_signal_id: "passive-one".to_owned(),
+                label: "Revenue mean".to_owned(),
+            },
+            ActiveSignalSummary {
+                active_signal_id: "active-two".to_owned(),
+                passive_signal_id: "passive-one".to_owned(),
+                label: "Revenue maximum".to_owned(),
+            },
+        ];
+        let selected = HashSet::from(["active-two".to_owned(), "other-parent".to_owned()]);
+        let (labels, defaults) = active_selection_options(&active_signals, &selected);
+        assert_eq!(
+            labels,
+            vec!["Revenue mean (active-one)", "Revenue maximum (active-two)"]
+        );
+        assert_eq!(defaults, vec![false, true]);
+        assert_eq!(
+            merge_active_signal_selection(&active_signals, &selected, vec![0]),
+            HashSet::from(["active-one".to_owned(), "other-parent".to_owned()])
+        );
+    }
+
+    #[test]
+    fn stored_config_fixture_remains_serializable_for_command_tests() {
+        let value = StoredConfig::default();
+        assert!(
+            serde_json::to_string(&value)
+                .expect("serialize config")
+                .contains('{')
+        );
+    }
 }

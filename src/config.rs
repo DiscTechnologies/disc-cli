@@ -47,6 +47,11 @@ impl ConfigStore {
         &self.root_dir
     }
 
+    #[cfg(test)]
+    pub(crate) fn at_root(root_dir: PathBuf) -> Self {
+        Self { root_dir }
+    }
+
     pub fn load_config(&self) -> Result<StoredConfig> {
         self.read_json::<StoredConfig>("config.json")
             .map(|maybe| maybe.unwrap_or_default())
@@ -183,11 +188,199 @@ impl ConfigStore {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigStore;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{ConfigStore, StoredAuth, StoredConfig};
+
+    fn temporary_store(test_name: &str) -> ConfigStore {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        ConfigStore {
+            root_dir: std::env::temp_dir().join(format!(
+                "disc-cli-config-{test_name}-{}-{nonce}",
+                std::process::id()
+            )),
+        }
+    }
+
+    fn remove_store(store: &ConfigStore) {
+        if store.root_dir.exists() {
+            fs::remove_dir_all(&store.root_dir).expect("remove temporary config directory");
+        }
+    }
 
     #[test]
     fn discover_returns_non_empty_root_dir() {
         let store = ConfigStore::discover().expect("config store");
         assert!(!store.root_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn config_and_auth_round_trip_and_clear_cleanly() {
+        let store = temporary_store("round-trip");
+        let config = StoredConfig {
+            http_base_url: Some("https://api.example.test".to_owned()),
+            ws_url: Some("wss://signals.example.test".to_owned()),
+            client_id: Some("client-one".to_owned()),
+        };
+        let auth = StoredAuth {
+            api_key: "secret-key".to_owned(),
+        };
+
+        assert_eq!(store.clear_auth().expect("clear absent auth"), false);
+        store.save_config(&config).expect("save config");
+        store.save_auth(&auth).expect("save auth");
+
+        let loaded_config = store.load_config().expect("load config");
+        assert_eq!(
+            loaded_config.http_base_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            loaded_config.ws_url.as_deref(),
+            Some("wss://signals.example.test")
+        );
+        assert_eq!(loaded_config.client_id.as_deref(), Some("client-one"));
+        assert_eq!(
+            store
+                .load_auth()
+                .expect("load auth")
+                .expect("stored auth")
+                .api_key,
+            "secret-key"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(store.root_dir.join("auth.json"))
+                .expect("auth metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert_eq!(store.clear_auth().expect("clear auth"), true);
+        assert!(store.load_auth().expect("load cleared auth").is_none());
+        remove_store(&store);
+    }
+
+    #[test]
+    fn missing_config_uses_defaults_and_cli_values_take_precedence() {
+        let store = temporary_store("precedence");
+        store
+            .save_auth(&StoredAuth {
+                api_key: "stored-key".to_owned(),
+            })
+            .expect("save auth");
+        store
+            .save_config(&StoredConfig {
+                http_base_url: Some("https://stored.example.test".to_owned()),
+                ws_url: Some("wss://stored.example.test".to_owned()),
+                client_id: Some("stored-client".to_owned()),
+            })
+            .expect("save config");
+
+        let stored = store
+            .resolve(None, None, None, None)
+            .expect("resolve stored config");
+        assert_eq!(stored.api_key, "stored-key");
+        assert_eq!(stored.http_base_url, "https://stored.example.test");
+        assert_eq!(stored.ws_url, "wss://stored.example.test");
+        assert_eq!(stored.client_id.as_deref(), Some("stored-client"));
+
+        let overridden = store
+            .resolve(
+                Some("cli-key"),
+                Some("https://cli.example.test"),
+                Some("wss://cli.example.test"),
+                Some("cli-client"),
+            )
+            .expect("resolve CLI config");
+        assert_eq!(overridden.api_key, "cli-key");
+        assert_eq!(overridden.http_base_url, "https://cli.example.test");
+        assert_eq!(overridden.ws_url, "wss://cli.example.test");
+        assert_eq!(overridden.client_id.as_deref(), Some("cli-client"));
+        remove_store(&store);
+    }
+
+    #[test]
+    fn defaults_apply_without_stored_endpoints_and_blank_client_id_is_removed() {
+        let store = temporary_store("defaults");
+        store
+            .save_auth(&StoredAuth {
+                api_key: "stored-key".to_owned(),
+            })
+            .expect("save auth");
+
+        let resolved = store
+            .resolve(None, None, None, Some(""))
+            .expect("resolve default endpoints");
+        assert_eq!(resolved.http_base_url, "https://api.disc.tech");
+        assert_eq!(resolved.ws_url, "wss://signals.disc.tech");
+        assert!(resolved.client_id.is_none());
+        remove_store(&store);
+    }
+
+    #[test]
+    fn resolve_rejects_missing_or_blank_api_keys() {
+        let store = temporary_store("missing-key");
+        let error = store
+            .resolve(None, None, None, None)
+            .expect_err("missing API key must fail");
+        assert!(error.to_string().contains("API key is not configured"));
+
+        store
+            .save_auth(&StoredAuth {
+                api_key: String::new(),
+            })
+            .expect("save blank auth");
+        let error = store
+            .resolve(Some(""), None, None, None)
+            .expect_err("blank API keys must fail");
+        assert!(error.to_string().contains("API key is not configured"));
+        remove_store(&store);
+    }
+
+    #[test]
+    fn malformed_config_and_auth_files_report_their_paths() {
+        let store = temporary_store("malformed");
+        fs::create_dir_all(&store.root_dir).expect("create config directory");
+        fs::write(store.root_dir.join("config.json"), "{not json").expect("write malformed config");
+        let config_error = store.load_config().expect_err("malformed config must fail");
+        assert!(config_error.to_string().contains("config.json"));
+
+        fs::remove_file(store.root_dir.join("config.json")).expect("remove config");
+        fs::write(store.root_dir.join("auth.json"), "[]").expect("write malformed auth");
+        let auth_error = store.load_auth().expect_err("malformed auth must fail");
+        assert!(auth_error.to_string().contains("auth.json"));
+        remove_store(&store);
+    }
+
+    #[test]
+    fn unreadable_config_path_reports_read_failure() {
+        let store = temporary_store("unreadable");
+        fs::create_dir_all(store.root_dir.join("config.json")).expect("create directory at path");
+
+        let error = store
+            .load_config()
+            .expect_err("directory cannot be read as config file");
+        assert!(error.to_string().contains("Failed to read"));
+        remove_store(&store);
+    }
+
+    #[test]
+    fn root_dir_returns_the_config_location() {
+        let root_dir = PathBuf::from("/tmp/disc-cli-config-location");
+        let store = ConfigStore {
+            root_dir: root_dir.clone(),
+        };
+        assert_eq!(store.root_dir(), &root_dir);
     }
 }

@@ -206,6 +206,18 @@ Run:
 cargo run --bin disc -- --help
 ```
 
+Run the behavioural test suite:
+
+```bash
+make test
+```
+
+The coverage gate requires at least 90% line, region, and function coverage:
+
+```bash
+make test-cov
+```
+
 ### Local wrapper
 
 ```bash
@@ -257,4 +269,3 @@ Artifacts:
 ## License
 
 See `LICENSE`.
-

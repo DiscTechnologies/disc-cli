@@ -168,3 +168,233 @@ impl DiscApiClient {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+
+    use serde_json::json;
+
+    use super::DiscApiClient;
+
+    fn serve_once(status: &str, body: &str) -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        let address = listener.local_addr().expect("server address");
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let (request_sender, request_receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_sender.send(String::from_utf8(request).expect("HTTP request is UTF-8"));
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        (format!("http://{address}"), request_receiver)
+    }
+
+    fn assert_request(receiver: Receiver<String>, path: &str) {
+        let request = receiver.recv().expect("captured request");
+        assert!(
+            request.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-disc-api-key: test-key\r\n"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validates_auth_and_propagates_api_key_header() {
+        let body = json!({
+            "authType": "API_KEY",
+            "authTokenId": "token-one",
+            "sessionId": "session-one",
+            "apiKeyId": "key-one",
+            "userId": "user-one",
+            "userType": "SUBJECT",
+            "expiresAt": null,
+            "revalidateAt": "2026-07-28T12:00:00Z"
+        })
+        .to_string();
+        let (base_url, request) = serve_once("200 OK", &body);
+        let client =
+            DiscApiClient::new(format!("{base_url}/"), "test-key").expect("create API client");
+
+        let response = client.validate().await.expect("validate response");
+
+        assert_eq!(response.auth_type, "API_KEY");
+        assert_eq!(response.auth_token_id, "token-one");
+        assert_eq!(response.session_id.as_deref(), Some("session-one"));
+        assert_eq!(response.api_key_id.as_deref(), Some("key-one"));
+        assert_eq!(response.user_id, "user-one");
+        assert_eq!(response.user_type, "SUBJECT");
+        assert_eq!(response.expires_at, None);
+        assert_eq!(response.revalidate_at, "2026-07-28T12:00:00Z");
+        assert_request(request, "/validate");
+    }
+
+    #[tokio::test]
+    async fn lists_passive_signals_as_values_and_typed_summaries() {
+        let body = json!({
+            "passiveSignals": [{
+                "passiveSignalId": "passive-one",
+                "label": "Revenue"
+            }]
+        })
+        .to_string();
+        let (base_url, request) = serve_once("200 OK", &body);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let values = client.list_passive_signals().await.expect("passive values");
+        assert_eq!(values[0]["passiveSignalId"], "passive-one");
+        assert_request(request, "/passive-signals");
+
+        let (base_url, request) = serve_once("200 OK", &body);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let summaries = client
+            .list_passive_signal_summaries()
+            .await
+            .expect("passive summaries");
+        assert_eq!(summaries[0].passive_signal_id, "passive-one");
+        assert_eq!(summaries[0].label, "Revenue");
+        assert_request(request, "/passive-signals");
+    }
+
+    #[tokio::test]
+    async fn gets_passive_and_active_signals_with_encoded_identifiers() {
+        let (base_url, request) = serve_once("200 OK", r#"{"label":"Passive"}"#);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let passive = client
+            .get_passive_signal("passive / one")
+            .await
+            .expect("passive signal");
+        assert_eq!(passive["label"], "Passive");
+        assert_request(request, "/passive-signals/passive%20%2F%20one");
+
+        let (base_url, request) = serve_once("200 OK", r#"{"label":"Active"}"#);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let active = client
+            .get_active_signal("active / one")
+            .await
+            .expect("active signal");
+        assert_eq!(active["label"], "Active");
+        assert_request(request, "/active-signals/active%20%2F%20one");
+    }
+
+    #[tokio::test]
+    async fn lists_active_signals_as_values_and_typed_summaries() {
+        let body = json!({
+            "activeSignals": [{
+                "activeSignalId": "active-one",
+                "passiveSignalId": "passive-one",
+                "label": "Revenue average"
+            }]
+        })
+        .to_string();
+        let expected_path = "/passive-signals/passive%20one/active-signals";
+
+        let (base_url, request) = serve_once("200 OK", &body);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let values = client
+            .list_active_signals("passive one")
+            .await
+            .expect("active values");
+        assert_eq!(values[0]["activeSignalId"], "active-one");
+        assert_request(request, expected_path);
+
+        let (base_url, request) = serve_once("200 OK", &body);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let summaries = client
+            .list_active_signal_summaries("passive one")
+            .await
+            .expect("active summaries");
+        assert_eq!(summaries[0].active_signal_id, "active-one");
+        assert_eq!(summaries[0].passive_signal_id, "passive-one");
+        assert_eq!(summaries[0].label, "Revenue average");
+        assert_request(request, expected_path);
+    }
+
+    #[tokio::test]
+    async fn missing_signal_arrays_are_rejected() {
+        let (base_url, _) = serve_once("200 OK", "{}");
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let error = client
+            .list_passive_signals()
+            .await
+            .expect_err("missing passive signals");
+        assert!(error.to_string().contains("`passiveSignals` array missing"));
+
+        let (base_url, _) = serve_once("200 OK", r#"{"activeSignals":"invalid"}"#);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let error = client
+            .list_active_signals("passive")
+            .await
+            .expect_err("invalid active signals");
+        assert!(error.to_string().contains("`activeSignals` array missing"));
+    }
+
+    #[tokio::test]
+    async fn http_errors_preserve_status_and_body_without_hiding_empty_responses() {
+        let (base_url, _) = serve_once("403 Forbidden", r#"{"error":"denied"}"#);
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let error = client.validate().await.expect_err("forbidden response");
+        assert!(
+            error
+                .to_string()
+                .contains(r#"HTTP 403 403 Forbidden: {"error":"denied"}"#)
+        );
+
+        let (base_url, _) = serve_once("500 Internal Server Error", "");
+        let client = DiscApiClient::new(base_url, "test-key").expect("create API client");
+        let error = client.validate().await.expect_err("empty error response");
+        assert!(error.to_string().contains("<empty body>"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_reports_endpoint_and_bounded_body_context() {
+        let body = "x".repeat(250);
+        let (base_url, _) = serve_once("200 OK", &body);
+        let client = DiscApiClient::new(base_url.clone(), "test-key").expect("create API client");
+        let error = client.validate().await.expect_err("malformed response");
+        let message = error.to_string();
+        assert!(message.contains(&format!("{base_url}/validate")));
+        assert!(message.contains(&"x".repeat(200)));
+        assert!(!message.contains(&"x".repeat(201)));
+    }
+
+    #[test]
+    fn invalid_api_key_header_value_is_rejected() {
+        let error = DiscApiClient::new("https://api.example.test".to_owned(), "bad\nkey")
+            .expect_err("invalid header");
+        assert!(
+            error
+                .to_string()
+                .contains("configured API key is not a valid HTTP header value")
+        );
+    }
+}
