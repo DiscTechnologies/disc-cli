@@ -212,7 +212,7 @@ Run the behavioural test suite:
 make test
 ```
 
-The coverage gate requires at least 90% line, region, and function coverage:
+The coverage gate requires at least 93% line, region, and function coverage:
 
 ```bash
 make test-cov

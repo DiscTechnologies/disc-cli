@@ -5,6 +5,6 @@ test:
 
 test-cov:
 	rustup run stable cargo llvm-cov --all-features \
-		--fail-under-lines 90 \
-		--fail-under-regions 90 \
-		--fail-under-functions 90
+		--fail-under-lines 93 \
+		--fail-under-regions 93 \
+		--fail-under-functions 93

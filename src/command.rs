@@ -28,6 +28,137 @@ struct ReconcileSubscriptionContext<'a> {
     format: crate::cli::StreamOutputFormat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveAction {
+    EditPassive,
+    EditActive,
+    Finish,
+    Quit,
+}
+
+struct DialoguerSubscriptionPrompts {
+    theme: ColorfulTheme,
+    #[cfg(test)]
+    script: Option<ScriptedSubscriptionPrompts>,
+}
+
+#[cfg(test)]
+struct ScriptedSubscriptionPrompts {
+    actions: std::collections::VecDeque<InteractiveAction>,
+    passive_selection: HashSet<String>,
+    passive_parents: std::collections::VecDeque<String>,
+    active_selection: HashSet<String>,
+    did_wait_for_stop: bool,
+}
+
+impl DialoguerSubscriptionPrompts {
+    fn new() -> Self {
+        Self {
+            theme: ColorfulTheme::default(),
+            #[cfg(test)]
+            script: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn scripted(actions: Vec<InteractiveAction>) -> Self {
+        Self {
+            theme: ColorfulTheme::default(),
+            script: Some(ScriptedSubscriptionPrompts {
+                actions: actions.into(),
+                passive_selection: HashSet::new(),
+                passive_parents: std::collections::VecDeque::new(),
+                active_selection: HashSet::new(),
+                did_wait_for_stop: false,
+            }),
+        }
+    }
+
+    fn choose_action(&mut self) -> Result<InteractiveAction> {
+        #[cfg(test)]
+        if let Some(script) = &mut self.script {
+            return Ok(script.actions.pop_front().expect("scripted action"));
+        }
+
+        let action = Select::with_theme(&self.theme)
+            .with_prompt("Manage subscriptions")
+            .items(&[
+                "Edit passive signals",
+                "Edit active signals",
+                "Finish and keep current subscriptions running",
+                "Quit and stop all subscriptions",
+            ])
+            .default(0)
+            .interact()
+            .context("Failed to read interactive selection.")?;
+        match action {
+            0 => Ok(InteractiveAction::EditPassive),
+            1 => Ok(InteractiveAction::EditActive),
+            2 => Ok(InteractiveAction::Finish),
+            3 => Ok(InteractiveAction::Quit),
+            _ => unreachable!(),
+        }
+    }
+
+    fn select_passive_signals(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+        selected_passive_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            return Ok(script.passive_selection.clone());
+        }
+
+        prompt_passive_signal_selection(&self.theme, passive_signals, selected_passive_ids)
+    }
+
+    fn select_passive_parent(
+        &mut self,
+        passive_signals: &[PassiveSignalSummary],
+    ) -> Result<PassiveSignalSummary> {
+        #[cfg(test)]
+        if let Some(script) = &mut self.script {
+            let parent_id = script
+                .passive_parents
+                .pop_front()
+                .expect("scripted passive parent");
+            return passive_signals
+                .iter()
+                .find(|signal| signal.passive_signal_id == parent_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing scripted passive parent"));
+        }
+
+        prompt_passive_parent(&self.theme, passive_signals)
+    }
+
+    fn select_active_signals(
+        &mut self,
+        active_signals: &[ActiveSignalSummary],
+        selected_active_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            return Ok(script.active_selection.clone());
+        }
+
+        prompt_active_signal_selection(&self.theme, active_signals, selected_active_ids)
+    }
+
+    async fn wait_for_stop(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(script) = &mut self.script {
+            script.did_wait_for_stop = true;
+            return Ok(());
+        }
+
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to wait for Ctrl+C.")
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     let store = ConfigStore::discover()?;
     run_with_store(cli, &store).await
@@ -315,9 +446,20 @@ async fn run_interactive_subscribe(
     client_id: Option<&str>,
     command: &InteractiveSubscribeCommand,
 ) -> Result<()> {
+    let mut prompts = DialoguerSubscriptionPrompts::new();
+    run_interactive_subscribe_with(client, ws_url, api_key, client_id, command, &mut prompts).await
+}
+
+async fn run_interactive_subscribe_with(
+    client: &DiscApiClient,
+    ws_url: &str,
+    api_key: &str,
+    client_id: Option<&str>,
+    command: &InteractiveSubscribeCommand,
+    prompts: &mut DialoguerSubscriptionPrompts,
+) -> Result<()> {
     let passive_signals = client.list_passive_signal_summaries().await?;
     let writer = create_file_writer(&command.destination)?;
-    let theme = ColorfulTheme::default();
     let mut selected_passive_ids = HashSet::<String>::new();
     let mut selected_active_ids = HashSet::<String>::new();
     let mut active_signal_cache = HashMap::<String, Vec<ActiveSignalSummary>>::new();
@@ -332,32 +474,16 @@ async fn run_interactive_subscribe(
             &command.destination,
         );
 
-        let action = Select::with_theme(&theme)
-            .with_prompt("Manage subscriptions")
-            .items(&[
-                "Edit passive signals",
-                "Edit active signals",
-                "Finish and keep current subscriptions running",
-                "Quit and stop all subscriptions",
-            ])
-            .default(0)
-            .interact()
-            .context("Failed to read interactive selection.")?;
-
-        match action {
-            0 => {
-                let next_selected = prompt_passive_signal_selection(
-                    &theme,
-                    &passive_signals,
-                    &selected_passive_ids,
-                )?;
-                selected_passive_ids = next_selected;
+        match prompts.choose_action()? {
+            InteractiveAction::EditPassive => {
+                selected_passive_ids =
+                    prompts.select_passive_signals(&passive_signals, &selected_passive_ids)?;
             }
-            1 => {
+            InteractiveAction::EditActive => {
                 if passive_signals.is_empty() {
                     println!("No passive signals available.");
                 } else {
-                    let passive_signal = prompt_passive_parent(&theme, &passive_signals)?;
+                    let passive_signal = prompts.select_passive_parent(&passive_signals)?;
                     let active_signals = match active_signal_cache
                         .get(&passive_signal.passive_signal_id)
                     {
@@ -375,15 +501,12 @@ async fn run_interactive_subscribe(
                     if active_signals.is_empty() {
                         println!("No active signals under `{}`.", passive_signal.label);
                     } else {
-                        selected_active_ids = prompt_active_signal_selection(
-                            &theme,
-                            &active_signals,
-                            &selected_active_ids,
-                        )?;
+                        selected_active_ids =
+                            prompts.select_active_signals(&active_signals, &selected_active_ids)?;
                     }
                 }
             }
-            2 => {
+            InteractiveAction::Finish => {
                 reconcile_subscriptions(
                     &mut tasks,
                     ReconcileSubscriptionContext {
@@ -401,17 +524,14 @@ async fn run_interactive_subscribe(
                     "Subscriptions are running. Output is being appended to {}. Press Ctrl+C to stop the CLI.",
                     command.destination.display()
                 );
-                tokio::signal::ctrl_c()
-                    .await
-                    .context("Failed to wait for Ctrl+C.")?;
+                prompts.wait_for_stop().await?;
                 abort_all_tasks(&mut tasks);
                 return Ok(());
             }
-            3 => {
+            InteractiveAction::Quit => {
                 abort_all_tasks(&mut tasks);
                 return Ok(());
             }
-            _ => unreachable!(),
         }
 
         reconcile_subscriptions(
@@ -720,7 +840,7 @@ fn validate_api_key(raw_value: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs;
     use std::io::{self, Read, Write};
     use std::net::TcpListener;
@@ -736,19 +856,21 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     use crate::cli::{
-        ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand, JsonOutputFormat,
-        ListOutputFormat, PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand,
-        StreamOptions, StreamOutputFilter, StreamOutputFormat, TailCommand, WindowSemantics,
+        ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand,
+        InteractiveSubscribeCommand, JsonOutputFormat, ListOutputFormat, PassiveSignalsCommand,
+        RootCommand, SignalsCommand, StreamCommand, StreamOptions, StreamOutputFilter,
+        StreamOutputFormat, TailCommand, WindowSemantics,
     };
     use crate::config::{ConfigStore, StoredConfig};
-    use crate::http::{ActiveSignalSummary, PassiveSignalSummary};
+    use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
     use crate::output::SharedWriter;
     use crate::ws::{SubscriptionKind, SubscriptionSpec};
 
     use super::{
-        ReconcileSubscriptionContext, abort_all_tasks, active_selection_options,
-        merge_active_signal_selection, passive_selection_options, print_subscription_summary,
-        reconcile_subscriptions, resolve_api_key_input, run_auth, run_config, run_signals,
+        DialoguerSubscriptionPrompts, InteractiveAction, ReconcileSubscriptionContext,
+        abort_all_tasks, active_selection_options, merge_active_signal_selection,
+        passive_selection_options, print_subscription_summary, reconcile_subscriptions,
+        resolve_api_key_input, run_auth, run_config, run_interactive_subscribe_with, run_signals,
         run_with_store, selected_passive_signal_ids, stream_options_from_tail,
         strip_ansi_sequences, validate_api_key,
     };
@@ -804,6 +926,36 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    fn serve_json_responses(bodies: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        let address = listener.local_addr().expect("server address");
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).expect("read request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
         });
         format!("http://{address}")
     }
@@ -1249,6 +1401,137 @@ mod tests {
         let lines = fs::read_to_string(&destination).expect("stream destination");
         assert_eq!(lines.lines().count(), 2);
         fs::remove_dir_all(root).expect("remove stream command root");
+    }
+
+    #[tokio::test]
+    async fn interactive_subscription_flow_edits_cached_selections_and_finishes_cleanly() {
+        let root = temporary_root("interactive");
+        fs::create_dir_all(&root).expect("create interactive root");
+        let http_base_url = serve_json_responses(vec![
+            serde_json::json!({
+                "passiveSignals": [{
+                    "passiveSignalId": "passive-one",
+                    "label": "Revenue"
+                }]
+            })
+            .to_string(),
+            serde_json::json!({
+                "activeSignals": [{
+                    "activeSignalId": "active-one",
+                    "passiveSignalId": "passive-one",
+                    "label": "Revenue average"
+                }]
+            })
+            .to_string(),
+        ]);
+        let client = DiscApiClient::new(http_base_url, "test-key").expect("API client");
+        let mut prompts = DialoguerSubscriptionPrompts::scripted(vec![
+            InteractiveAction::EditPassive,
+            InteractiveAction::EditActive,
+            InteractiveAction::EditActive,
+            InteractiveAction::Finish,
+        ]);
+        let script = prompts.script.as_mut().expect("scripted prompts");
+        script.passive_selection = HashSet::from(["passive-one".to_owned()]);
+        script.passive_parents =
+            VecDeque::from(["passive-one".to_owned(), "passive-one".to_owned()]);
+        script.active_selection = HashSet::from(["active-one".to_owned()]);
+        let command = InteractiveSubscribeCommand {
+            options: stream_options(),
+            format: StreamOutputFormat::Ndjson,
+            destination: root.join("interactive.ndjson"),
+        };
+
+        run_interactive_subscribe_with(
+            &client,
+            "ws://127.0.0.1:1",
+            "test-key",
+            Some("client-one"),
+            &command,
+            &mut prompts,
+        )
+        .await
+        .expect("interactive subscription");
+
+        assert!(
+            prompts
+                .script
+                .as_ref()
+                .expect("scripted prompts")
+                .did_wait_for_stop
+        );
+        fs::remove_dir_all(root).expect("remove interactive root");
+    }
+
+    #[tokio::test]
+    async fn interactive_subscription_flow_handles_empty_catalogues_and_quit() {
+        let root = temporary_root("interactive-empty");
+        fs::create_dir_all(&root).expect("create interactive root");
+        let empty_client = DiscApiClient::new(
+            serve_json_responses(vec![r#"{"passiveSignals":[]}"#.to_owned()]),
+            "test-key",
+        )
+        .expect("empty API client");
+        let mut empty_prompts = DialoguerSubscriptionPrompts::scripted(vec![
+            InteractiveAction::EditActive,
+            InteractiveAction::Quit,
+        ]);
+        let empty_command = InteractiveSubscribeCommand {
+            options: stream_options(),
+            format: StreamOutputFormat::Pretty,
+            destination: root.join("empty.ndjson"),
+        };
+        run_interactive_subscribe_with(
+            &empty_client,
+            "ws://127.0.0.1:1",
+            "test-key",
+            None,
+            &empty_command,
+            &mut empty_prompts,
+        )
+        .await
+        .expect("empty interactive subscription");
+
+        let no_active_client = DiscApiClient::new(
+            serve_json_responses(vec![
+                serde_json::json!({
+                    "passiveSignals": [{
+                        "passiveSignalId": "passive-one",
+                        "label": "Revenue"
+                    }]
+                })
+                .to_string(),
+                r#"{"activeSignals":[]}"#.to_owned(),
+            ]),
+            "test-key",
+        )
+        .expect("API client without active signals");
+        let mut no_active_prompts = DialoguerSubscriptionPrompts::scripted(vec![
+            InteractiveAction::EditActive,
+            InteractiveAction::Quit,
+        ]);
+        no_active_prompts
+            .script
+            .as_mut()
+            .expect("scripted prompts")
+            .passive_parents = VecDeque::from(["passive-one".to_owned()]);
+        let no_active_command = InteractiveSubscribeCommand {
+            options: stream_options(),
+            format: StreamOutputFormat::Json,
+            destination: root.join("no-active.ndjson"),
+        };
+        run_interactive_subscribe_with(
+            &no_active_client,
+            "ws://127.0.0.1:1",
+            "test-key",
+            None,
+            &no_active_command,
+            &mut no_active_prompts,
+        )
+        .await
+        .expect("interactive subscription without active signals");
+
+        fs::remove_dir_all(root).expect("remove interactive root");
     }
 
     #[test]
