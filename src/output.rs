@@ -22,7 +22,10 @@ pub fn create_file_writer(path: &Path) -> Result<SharedWriter> {
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("Failed to open destination file at {}.", path.display()))?;
+        .context(format!(
+            "Failed to open destination file at {}.",
+            path.display()
+        ))?;
     Ok(Arc::new(Mutex::new(Box::new(file))))
 }
 

@@ -3,6 +3,31 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Debug, Clone)]
+pub enum HttpCredential<'a> {
+    ApiKey(&'a str),
+    OAuth {
+        access_token: &'a str,
+        subject_context_token: &'a str,
+    },
+}
+
+pub trait IntoHttpCredential<'a> {
+    fn into_http_credential(self) -> HttpCredential<'a>;
+}
+
+impl<'a> IntoHttpCredential<'a> for HttpCredential<'a> {
+    fn into_http_credential(self) -> HttpCredential<'a> {
+        self
+    }
+}
+
+impl<'a> IntoHttpCredential<'a> for &'a str {
+    fn into_http_credential(self) -> HttpCredential<'a> {
+        HttpCredential::ApiKey(self)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidateResponse {
     #[serde(rename = "authType")]
@@ -58,12 +83,32 @@ pub struct DiscApiClient {
 }
 
 impl DiscApiClient {
-    pub fn new(base_url: String, api_key: &str) -> Result<Self> {
+    pub fn new<'a>(base_url: String, credential: impl IntoHttpCredential<'a>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        let header_name = HeaderName::from_static("x-disc-api-key");
-        let header_value = HeaderValue::from_str(api_key)
-            .context("The configured API key is not a valid HTTP header value.")?;
-        headers.insert(header_name, header_value);
+        match credential.into_http_credential() {
+            HttpCredential::ApiKey(api_key) => {
+                headers.insert(
+                    HeaderName::from_static("x-disc-api-key"),
+                    HeaderValue::from_str(api_key)
+                        .context("The configured API key is not a valid HTTP header value.")?,
+                );
+            }
+            HttpCredential::OAuth {
+                access_token,
+                subject_context_token,
+            } => {
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {access_token}"))
+                        .context("The OAuth access token is not a valid HTTP header value.")?,
+                );
+                headers.insert(
+                    HeaderName::from_static("x-disc-subject-context"),
+                    HeaderValue::from_str(subject_context_token)
+                        .context("The subject-context token is not a valid HTTP header value.")?,
+                );
+            }
+        }
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -146,7 +191,7 @@ impl DiscApiClient {
             .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("HTTP request failed for {url}."))?;
+            .context(format!("HTTP request failed for {url}."))?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -160,7 +205,7 @@ impl DiscApiClient {
             anyhow::bail!("HTTP {} {}: {}", status.as_u16(), status, sanitized_body);
         }
 
-        serde_json::from_str::<T>(&body).with_context(|| {
+        serde_json::from_str::<T>(&body).context({
             format!(
                 "Failed to decode JSON response from {url}. Response body began with: {}",
                 body.chars().take(200).collect::<String>()

@@ -9,8 +9,8 @@ Native Rust CLI for **Disc** – discover signals and consume live data streams.
 ```bash
 brew install disctechnologies/tap/disc
 
-# set your API key once
-disc auth api-key set
+# approve this machine in your browser
+disc auth login
 
 # stream a signal
 disc signals passive subscribe <passive-signal-id> --format ndjson
@@ -22,7 +22,7 @@ disc signals passive subscribe <passive-signal-id> --format ndjson
 
 - 🔍 Discover passive and active signals
 - 📡 Subscribe to live signal streams (WebSocket)
-- 🔐 Authenticate via API key (`X-Disc-Api-Key`)
+- 🔐 Authenticate with OAuth Authorization Code + PKCE or the Device Authorization Grant
 - ⚡ Stream data to stdout (pipe-friendly)
 
 Backed by:
@@ -50,7 +50,40 @@ disc --version
 
 ## Authentication
 
-Set your API key (stored locally):
+Sign in through Keycloak with Authorization Code + PKCE. The CLI opens an ephemeral
+`127.0.0.1` callback and asks you to choose an eligible Disc product subject:
+
+```bash
+disc auth login
+```
+
+For a remote or headless terminal, use the standard OAuth device flow:
+
+```bash
+disc auth login --device
+```
+
+Use `--no-browser` to print the PKCE authorization URL without launching a browser. Use
+`--subject <id-or-key>` for deterministic non-interactive subject selection.
+
+Each login creates or replaces one local subject profile. List and switch profiles with:
+
+```bash
+disc auth list
+disc auth use <profile>
+```
+
+Revoke the active OAuth session remotely and remove its local credentials:
+
+```bash
+disc auth logout
+disc auth logout --all
+```
+
+`disc auth clear` is intentionally limited to manual API-key profiles; OAuth profiles must use
+logout so local deletion cannot silently skip server-side revocation.
+
+Manual API-key setup remains available as an explicit automation compatibility path:
 
 ```bash
 disc auth api-key set
@@ -62,10 +95,11 @@ Or pass per command:
 DISC_API_KEY=... disc auth whoami
 ```
 
-Check current auth:
+Check current auth (`status` is an alias):
 
 ```bash
 disc auth whoami
+disc auth status
 ```
 
 ---
@@ -188,7 +222,14 @@ Files:
 - `config.json`
 - `auth.json`
 
-🔐 API keys are stored locally and never committed to the repo.
+`auth.json` is atomically written with owner-only permissions. OAuth profiles store issuer, public client, user, and
+subject metadata plus an opaque credential-store account reference. Rotating refresh tokens are stored only in the
+operating-system credential store (macOS Keychain, Windows Credential Manager, or the platform Linux secret service).
+There is no plaintext fallback. Manual API-key profiles remain in `auth.json` for backwards-compatible automation.
+
+OAuth access tokens are short lived and refreshed under a cross-process lock. HTTP calls send the access token and a
+fresh subject-context token. WebSocket connections mint a 30-second single-use ticket so OAuth bearer material is never
+placed in a WebSocket subprotocol.
 
 ---
 
@@ -210,6 +251,14 @@ Run the behavioural test suite:
 
 ```bash
 make test
+```
+
+Production validation also requires:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo build --release --locked
 ```
 
 The coverage gate requires at least 93% line, region, and function coverage:
@@ -241,6 +290,10 @@ Env precedence:
 ## Release & distribution (maintainers)
 
 `disc-cli` is distributed as **prebuilt binaries** via GitHub Releases and installed via Homebrew.
+Release CI builds native executables for Apple Silicon and Intel macOS, x86-64 Linux, and
+x86-64 Windows. Every archive is included in the published GitHub release and covered
+by `SHA256SUMS.txt`. GitHub Actions also publishes signed SLSA build-provenance
+attestations for every archive. Homebrew consumes only the macOS and Linux archives.
 
 Create a release:
 
@@ -254,6 +307,15 @@ Artifacts:
 - `disc-<target>.tar.gz`
 - `SHA256SUMS.txt`
 - `disc.rb` (Homebrew formula)
+
+The Windows archive contains `disc.exe`; Unix archives contain `disc`.
+
+Verify a downloaded archive's checksum and signed provenance:
+
+```bash
+shasum -a 256 --check --ignore-missing SHA256SUMS.txt
+gh attestation verify disc-<target>.tar.gz --repo DiscTechnologies/disc-cli
+```
 
 ---
 

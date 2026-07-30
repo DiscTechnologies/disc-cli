@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::select;
@@ -12,8 +13,28 @@ use tokio_tungstenite::{
 };
 
 use crate::cli::{StreamOptions, WindowSemantics};
+use crate::config::StoredAuthProfile;
 
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_millis(1_000);
+
+#[derive(Debug, Clone)]
+pub enum WsCredential {
+    ApiKey(String),
+    Ticket(String),
+    OAuth { profile: Box<StoredAuthProfile> },
+}
+
+impl From<&str> for WsCredential {
+    fn from(value: &str) -> Self {
+        Self::ApiKey(value.to_owned())
+    }
+}
+
+impl From<&WsCredential> for WsCredential {
+    fn from(value: &WsCredential) -> Self {
+        value.clone()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubscriptionKind {
@@ -185,9 +206,9 @@ impl InboundEvent {
     }
 }
 
-pub async fn run_subscription<F>(
+pub async fn run_subscription<F, C>(
     ws_url: &str,
-    api_key: &str,
+    credential: C,
     client_id: Option<&str>,
     spec: &SubscriptionSpec,
     options: &StreamOptions,
@@ -196,7 +217,9 @@ pub async fn run_subscription<F>(
 ) -> Result<()>
 where
     F: FnMut(InboundEvent) -> Result<bool>,
+    C: Into<WsCredential>,
 {
+    let credential = credential.into();
     let targets = build_targets(spec, options);
     let payload = SubscribePayload {
         action_type: "SUBSCRIBE",
@@ -207,7 +230,8 @@ where
     let timeout_duration = options.timeout;
 
     loop {
-        let protocols = build_protocols(api_key, client_id);
+        let connection_credential = resolve_connection_credential(&credential).await?;
+        let protocols = build_protocols(&connection_credential, client_id);
         let mut request = ws_url
             .into_client_request()
             .context("Failed to build websocket request.")?;
@@ -230,8 +254,8 @@ where
         } else {
             connect_async(request).await
         };
-        let (ws_stream, _) = connection_result
-            .with_context(|| format!("Failed to connect to websocket at {ws_url}."))?;
+        let (ws_stream, _) =
+            connection_result.context(format!("Failed to connect to websocket at {ws_url}."))?;
         let (mut writer, mut reader) = ws_stream.split();
 
         writer
@@ -363,12 +387,63 @@ fn build_target(
     }
 }
 
-fn build_protocols(api_key: &str, client_id: Option<&str>) -> Vec<String> {
-    let mut protocols = vec![format!("apiKey-{api_key}")];
+fn build_protocols(credential: &WsCredential, client_id: Option<&str>) -> Vec<String> {
+    let mut protocols = match credential {
+        WsCredential::ApiKey(api_key) => vec![format!("apiKey-{api_key}")],
+        WsCredential::Ticket(ticket) => vec![format!("sessionId-ticket.{ticket}")],
+        WsCredential::OAuth { .. } => {
+            unreachable!("OAuth credentials are exchanged for a WebSocket ticket")
+        }
+    };
     if let Some(value) = client_id {
         protocols.push(format!("clientId-{value}"));
     }
     protocols
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSocketTicketResponse {
+    ticket: String,
+    expires_at: String,
+}
+
+async fn resolve_connection_credential(credential: &WsCredential) -> Result<WsCredential> {
+    match credential {
+        WsCredential::ApiKey(value) => Ok(WsCredential::ApiKey(value.clone())),
+        WsCredential::Ticket(_) => bail!("WebSocket tickets cannot be reused."),
+        WsCredential::OAuth { profile } => {
+            let oauth = crate::auth_login::runtime_oauth(profile).await?;
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .context("Failed to build WebSocket ticket client.")?
+                .post(format!(
+                    "{}/auth/websocket-ticket",
+                    profile.api_base_url.trim_end_matches('/')
+                ))
+                .bearer_auth(oauth.access_token.expose_secret())
+                .header(
+                    "X-Disc-Subject-Context",
+                    oauth.subject_context_token.expose_secret(),
+                )
+                .send()
+                .await
+                .context("Failed to request a WebSocket ticket.")?
+                .error_for_status()
+                .context("Disc rejected the WebSocket ticket request.")?;
+            let ticket = response
+                .json::<WebSocketTicketResponse>()
+                .await
+                .context("Disc returned an invalid WebSocket ticket.")?;
+            if ticket.ticket.trim().is_empty()
+                || chrono::DateTime::parse_from_rfc3339(&ticket.expires_at).is_err()
+            {
+                bail!("Disc returned an invalid WebSocket ticket.");
+            }
+            Ok(WsCredential::Ticket(ticket.ticket))
+        }
+    }
 }
 
 fn decode_message(message: Message) -> Result<Option<InboundEvent>> {
@@ -450,17 +525,15 @@ fn decode_value(value: Value) -> Result<Option<InboundEvent>> {
 }
 
 fn required_string<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .with_context(|| format!("Expected `{key}` to be a string in websocket frame."))
+    object.get(key).and_then(Value::as_str).context(format!(
+        "Expected `{key}` to be a string in websocket frame."
+    ))
 }
 
 fn required_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<u64> {
-    object
-        .get(key)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("Expected `{key}` to be an unsigned integer in websocket frame."))
+    object.get(key).and_then(Value::as_u64).context(format!(
+        "Expected `{key}` to be an unsigned integer in websocket frame."
+    ))
 }
 
 fn compact_json(value: &Value) -> String {
@@ -481,8 +554,9 @@ mod tests {
     use crate::cli::{StreamOptions, StreamOutputFilter, WindowSemantics};
 
     use super::{
-        InboundEvent, SubscriptionKind, SubscriptionSpec, build_protocols, build_targets,
-        decode_message, decode_value, handle_next_message, run_subscription,
+        InboundEvent, SubscriptionKind, SubscriptionSpec, WsCredential, build_protocols,
+        build_targets, decode_message, decode_value, handle_next_message,
+        resolve_connection_credential, run_subscription,
     };
 
     fn stream_options() -> StreamOptions {
@@ -644,10 +718,17 @@ mod tests {
 
     #[test]
     fn websocket_protocols_include_optional_client_identity() {
-        assert_eq!(build_protocols("secret", None), vec!["apiKey-secret"]);
         assert_eq!(
-            build_protocols("secret", Some("client")),
+            build_protocols(&WsCredential::ApiKey("secret".to_owned()), None),
+            vec!["apiKey-secret"]
+        );
+        assert_eq!(
+            build_protocols(&WsCredential::ApiKey("secret".to_owned()), Some("client")),
             vec!["apiKey-secret", "clientId-client"]
+        );
+        assert_eq!(
+            build_protocols(&WsCredential::Ticket("one-time".to_owned()), Some("client")),
+            vec!["sessionId-ticket.one-time", "clientId-client"]
         );
     }
 
@@ -857,6 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_sends_auth_and_targets_then_delivers_data_to_callback() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -951,6 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_timeout_returns_without_waiting_for_server_close() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -997,6 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_honours_no_reconnect_after_clean_server_close() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1083,5 +1167,19 @@ mod tests {
         .await
         .expect_err("connection refusal");
         assert!(error.to_string().contains("Failed to connect to websocket"));
+
+        assert!(matches!(
+            resolve_connection_credential(&WsCredential::ApiKey("test-key".to_owned()))
+                .await
+                .expect("API key connection credential"),
+            WsCredential::ApiKey(value) if value == "test-key"
+        ));
+        assert!(
+            resolve_connection_credential(&WsCredential::Ticket("spent".to_owned()))
+                .await
+                .expect_err("ticket reuse")
+                .to_string()
+                .contains("cannot be reused")
+        );
     }
 }

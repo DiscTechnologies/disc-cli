@@ -58,11 +58,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "$binary_path" "$temp_dir/disc"
+binary_name="disc"
+if [[ "$target_triple" == *-windows-* ]]; then
+  binary_name="disc.exe"
+fi
+
+cp "$binary_path" "$temp_dir/$binary_name"
 cp "$repo_root/README.md" "$temp_dir/README.md"
 cp "$repo_root/LICENSE" "$temp_dir/LICENSE"
-chmod 0755 "$temp_dir/disc"
+chmod 0755 "$temp_dir/$binary_name"
 
-tar -C "$temp_dir" -czf "$output_dir/$archive_name" disc README.md LICENSE
+tar -C "$temp_dir" -czf "$output_dir/$archive_name" "$binary_name" README.md LICENSE
 
 echo "Created $output_dir/$archive_name"
