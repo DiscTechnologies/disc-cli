@@ -1,0 +1,210 @@
+/*
+ * Self-contained projection of @disctech/disc-ui-theme's Disc Dark tokens.
+ * The loopback callback cannot load application assets or external styles.
+ */
+:root {
+  color-scheme: dark;
+  --disc-color-bg-default: #08090a;
+  --disc-color-bg-panel: #141516;
+  --disc-color-bg-card: #242424;
+  --disc-color-border-base: rgba(255, 255, 255, 0.12);
+  --disc-color-fg-default: #e4e4e4;
+  --disc-color-fg-muted: #999999;
+  --disc-color-accent: #6b9fe6;
+  --disc-color-accent-strong: #b6cff3;
+  --disc-color-status-success: #6bcd8d;
+  --disc-color-status-danger: #ef6b73;
+  --disc-surface-canvas: var(--disc-color-bg-default);
+  --disc-surface-panel: color-mix(in srgb, var(--disc-color-bg-panel) 94%, transparent);
+  --disc-surface-overlay: color-mix(in srgb, var(--disc-color-bg-panel) 96%, transparent);
+  --disc-text-primary: var(--disc-color-fg-default);
+  --disc-text-secondary: color-mix(
+    in srgb,
+    var(--disc-color-fg-default) 80%,
+    var(--disc-color-fg-muted) 20%
+  );
+  --disc-text-muted: var(--disc-color-fg-muted);
+  --disc-border-default: var(--disc-color-border-base);
+  --disc-font-body: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --radius-sm: 8px;
+  font-family: var(--disc-font-body);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  padding: clamp(12px, 3dvw, 18px);
+  background: var(--disc-surface-canvas);
+  color: var(--disc-text-primary);
+}
+
+.wave {
+  position: fixed;
+  z-index: 0;
+  width: 118vmax;
+  height: 19vmax;
+  border-radius: 50%;
+  opacity: 0.72;
+  filter: blur(1px);
+  pointer-events: none;
+}
+
+.wave::after {
+  content: "";
+  position: absolute;
+  inset: 8% 0;
+  border-block: 1px solid color-mix(in srgb, var(--disc-color-accent-strong) 28%, transparent);
+  border-radius: inherit;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent 0 4px,
+    color-mix(in srgb, var(--disc-color-accent) 24%, transparent) 4px 5px
+  );
+  mask-image: linear-gradient(90deg, transparent 4%, black 28% 72%, transparent 96%);
+}
+
+.wave-one {
+  top: -3vmax;
+  left: -47vmax;
+  transform: rotate(58deg);
+}
+
+.wave-two {
+  right: -49vmax;
+  bottom: -5vmax;
+  transform: rotate(56deg);
+}
+
+main {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 32rem);
+  display: grid;
+  gap: 1.5rem;
+  padding: clamp(20px, 3.2dvw, 28px);
+  border: 1px solid var(--disc-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--disc-surface-overlay);
+  backdrop-filter: blur(10px);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: fit-content;
+  color: var(--disc-text-primary);
+  font-size: 1rem;
+  font-weight: 500;
+  letter-spacing: 0.34em;
+}
+
+.brand-mark {
+  position: relative;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+.brand-mark::before {
+  content: "";
+  position: absolute;
+  top: calc(50% - 1px);
+  left: calc(50% - 1px);
+  width: 2px;
+  height: 2px;
+  border-radius: 9999px;
+  background: var(--disc-surface-canvas);
+}
+
+.brand-mark::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 1px);
+  left: 62%;
+  width: 30%;
+  height: 2px;
+  border-radius: 9999px;
+  background: var(--disc-surface-canvas);
+}
+
+.content {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.status {
+  width: 2.75rem;
+  height: 2.75rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--status-color) 52%, var(--disc-border-default));
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--status-color) 13%, transparent);
+  color: var(--status-color);
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.success {
+  --status-color: var(--disc-color-status-success);
+}
+
+.cancelled {
+  --status-color: var(--disc-color-status-danger);
+}
+
+.copy {
+  display: grid;
+  gap: 0.625rem;
+}
+
+h1 {
+  margin: 0;
+  color: var(--disc-text-primary);
+  font-size: clamp(1.25rem, 3.6dvw, 1.5rem);
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+p {
+  margin: 0;
+  color: var(--disc-text-secondary);
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.hint {
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--disc-border-default);
+  color: var(--disc-text-muted);
+  font-size: 0.875rem;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  main {
+    animation: enter 180ms ease-out;
+  }
+
+  @keyframes enter {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+}
