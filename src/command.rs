@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 use tokio::task::JoinHandle;
 
+use crate::auth_login;
 use crate::cli::{
     ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand,
     InteractiveSubscribeCommand, PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand,
     StreamOptions, TailCommand,
 };
-use crate::config::{ConfigStore, StoredAuth};
+use crate::config::{ConfigStore, StoredAuthProfile};
 use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
 use crate::output::{
     SharedWriter, create_file_writer, create_stdout_writer, print_json_value, print_signal_list,
@@ -190,12 +191,37 @@ async fn run_auth(
     store: &ConfigStore,
 ) -> Result<()> {
     match command {
+        AuthCommand::Login {
+            no_browser,
+            machine_label,
+        } => auth_login::login(store, http_base_url, machine_label, no_browser).await,
+        AuthCommand::List => {
+            let Some(auth) = store.load_auth()? else {
+                println!("No stored Disc auth profiles.");
+                return Ok(());
+            };
+            for (name, profile) in auth.profiles {
+                let marker = if auth.active_profile.as_deref() == Some(name.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                println!(
+                    "{marker} {name}  {}  {}",
+                    profile.display_name.as_deref().unwrap_or("Unknown subject"),
+                    profile.api_base_url
+                );
+            }
+            Ok(())
+        }
+        AuthCommand::Use { profile } => {
+            store.use_profile(&profile)?;
+            println!("Active Disc auth profile: {profile}");
+            Ok(())
+        }
         AuthCommand::ApiKey(command) => match command {
             ApiKeyCommand::Set { value, stdin } => {
                 let api_key = resolve_api_key_input(value, stdin)?;
-                store.save_auth(&StoredAuth {
-                    api_key: api_key.clone(),
-                })?;
                 let mut config = store.load_config()?;
                 if http_base_url.is_some() {
                     config.http_base_url = http_base_url;
@@ -207,6 +233,19 @@ async fn run_auth(
                     config.client_id = client_id;
                 }
                 store.save_config(&config)?;
+                let api_base_url = config
+                    .http_base_url
+                    .unwrap_or_else(|| "https://api.disc.tech".to_owned());
+                store.save_profile(StoredAuthProfile {
+                    profile: "manual".to_owned(),
+                    api_key,
+                    api_base_url,
+                    subject_id: None,
+                    subject_key: None,
+                    subject_kind: None,
+                    display_name: Some("Manual API key".to_owned()),
+                    created_at: None,
+                })?;
                 println!("Stored API key in {}.", store.root_dir().display());
                 Ok(())
             }
@@ -223,12 +262,23 @@ async fn run_auth(
             let json = validate_to_json(&response);
             print_json_value(&json, format)
         }
-        AuthCommand::Clear => {
-            let removed = store.clear_auth()?;
-            if removed {
-                println!("Cleared stored API key.");
+        AuthCommand::Clear { all } => {
+            let removed = if all {
+                store.clear_auth()?
             } else {
-                println!("No stored API key to clear.");
+                store.clear_active_profile()?
+            };
+            if removed {
+                println!(
+                    "{}",
+                    if all {
+                        "Cleared all stored Disc auth profiles."
+                    } else {
+                        "Cleared active Disc auth profile."
+                    }
+                );
+            } else {
+                println!("No stored Disc auth profile to clear.");
             }
             Ok(())
         }
@@ -1092,6 +1142,7 @@ mod tests {
                 .load_auth()
                 .expect("load auth")
                 .expect("stored auth")
+                .profiles["manual"]
                 .api_key,
             "secret"
         );
@@ -1103,13 +1154,27 @@ mod tests {
         assert_eq!(config.ws_url.as_deref(), Some("wss://signals.example.test"));
         assert_eq!(config.client_id.as_deref(), Some("client-one"));
 
-        run_auth(AuthCommand::Clear, None, None, None, None, &store)
-            .await
-            .expect("clear stored auth");
+        run_auth(
+            AuthCommand::Clear { all: false },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("clear stored auth");
         assert!(store.load_auth().expect("load cleared auth").is_none());
-        run_auth(AuthCommand::Clear, None, None, None, None, &store)
-            .await
-            .expect("clear absent auth");
+        run_auth(
+            AuthCommand::Clear { all: false },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("clear absent auth");
         fs::remove_dir_all(root).expect("remove auth root");
     }
 
@@ -1135,7 +1200,7 @@ mod tests {
                 http_base_url: None,
                 ws_url: None,
                 client_id: None,
-                command: RootCommand::Auth(AuthCommand::Clear),
+                command: RootCommand::Auth(AuthCommand::Clear { all: false }),
             },
             &store,
         )

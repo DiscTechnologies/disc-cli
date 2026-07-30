@@ -80,13 +80,27 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
+    #[command(about = "Sign in through your browser")]
+    Login {
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+        #[arg(long)]
+        machine_label: Option<String>,
+    },
+    #[command(about = "List stored subject profiles")]
+    List,
+    #[command(about = "Select a stored subject profile")]
+    Use { profile: String },
     #[command(subcommand)]
     ApiKey(ApiKeyCommand),
     Whoami {
         #[arg(long, value_enum, default_value_t = JsonOutputFormat::Json)]
         format: JsonOutputFormat,
     },
-    Clear,
+    Clear {
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -81,7 +81,7 @@ fn auth_api_key_can_be_stored_from_stdin_and_cleared() {
         .expect("run auth clear");
     let (stdout, stderr) = output_text(&cleared);
     assert!(cleared.status.success(), "stderr: {stderr}");
-    assert!(stdout.contains("Cleared stored API key"));
+    assert!(stdout.contains("Cleared active Disc auth profile"));
 
     fs::remove_dir_all(home).expect("remove temporary home");
 }

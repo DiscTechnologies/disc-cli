@@ -1,3 +1,4 @@
+mod auth_login;
 mod cli;
 mod command;
 mod config;

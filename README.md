@@ -9,8 +9,8 @@ Native Rust CLI for **Disc** – discover signals and consume live data streams.
 ```bash
 brew install disctechnologies/tap/disc
 
-# set your API key once
-disc auth api-key set
+# approve this machine in your browser
+disc auth login
 
 # stream a signal
 disc signals passive subscribe <passive-signal-id> --format ndjson
@@ -22,7 +22,7 @@ disc signals passive subscribe <passive-signal-id> --format ndjson
 
 - 🔍 Discover passive and active signals
 - 📡 Subscribe to live signal streams (WebSocket)
-- 🔐 Authenticate via API key (`X-Disc-Api-Key`)
+- 🔐 Authenticate in the browser with a subject-bound API key
 - ⚡ Stream data to stdout (pipe-friendly)
 
 Backed by:
@@ -50,7 +50,33 @@ disc --version
 
 ## Authentication
 
-Set your API key (stored locally):
+Sign in and approve the requested Disc subject in your browser:
+
+```bash
+disc auth login
+```
+
+For a remote or headless terminal, open the printed URL on another device:
+
+```bash
+disc auth login --no-browser
+```
+
+Each browser login creates or replaces a local subject profile. List and switch profiles with:
+
+```bash
+disc auth list
+disc auth use <profile>
+```
+
+Clear the active profile, or every profile:
+
+```bash
+disc auth clear
+disc auth clear --all
+```
+
+Manual API-key setup remains available for automation and recovery:
 
 ```bash
 disc auth api-key set
@@ -188,7 +214,8 @@ Files:
 - `config.json`
 - `auth.json`
 
-🔐 API keys are stored locally and never committed to the repo.
+`auth.json` stores subject profiles and their API keys with owner-only permissions. API keys are never committed to the
+repo.
 
 ---
 
