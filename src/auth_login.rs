@@ -838,7 +838,9 @@ async fn refresh_with_store(
     .await?;
     store
         .set_refresh_token(account, tokens.refresh_token.expose_secret())
-        .context("Failed to persist the rotated OAuth refresh token; run `disc login` again.")?;
+        .context(
+            "Failed to persist the rotated OAuth refresh token; run `disc auth login` again.",
+        )?;
     Ok(tokens)
 }
 
