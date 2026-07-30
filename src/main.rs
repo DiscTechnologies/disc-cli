@@ -2,6 +2,7 @@ mod auth_login;
 mod cli;
 mod command;
 mod config;
+mod credential_store;
 mod http;
 mod output;
 mod ws;

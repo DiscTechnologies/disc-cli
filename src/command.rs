@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
+use secrecy::{ExposeSecret, SecretString};
 use tokio::task::JoinHandle;
 
 use crate::auth_login;
@@ -13,17 +14,122 @@ use crate::cli::{
     StreamOptions, TailCommand,
 };
 use crate::config::{ConfigStore, StoredAuthProfile};
-use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
+use crate::http::{ActiveSignalSummary, DiscApiClient, HttpCredential, PassiveSignalSummary};
 use crate::output::{
     SharedWriter, create_file_writer, create_stdout_writer, print_json_value, print_signal_list,
     should_emit_event, validate_to_json, write_subscription_event,
 };
-use crate::ws::{SubscriptionKind, SubscriptionSpec, run_subscription};
+use crate::ws::{SubscriptionKind, SubscriptionSpec, WsCredential, run_subscription};
+
+enum RuntimeCredential {
+    ApiKey(String),
+    OAuth {
+        access_token: SecretString,
+        subject_context_token: SecretString,
+        profile: Box<StoredAuthProfile>,
+    },
+}
+
+struct RuntimeConfig {
+    credential: RuntimeCredential,
+    http_base_url: String,
+    ws_url: String,
+    client_id: Option<String>,
+}
+
+impl RuntimeConfig {
+    fn http_credential(&self) -> HttpCredential<'_> {
+        match &self.credential {
+            RuntimeCredential::ApiKey(value) => HttpCredential::ApiKey(value),
+            RuntimeCredential::OAuth {
+                access_token,
+                subject_context_token,
+                ..
+            } => HttpCredential::OAuth {
+                access_token: access_token.expose_secret(),
+                subject_context_token: subject_context_token.expose_secret(),
+            },
+        }
+    }
+
+    fn ws_credential(&self) -> WsCredential {
+        match &self.credential {
+            RuntimeCredential::ApiKey(value) => WsCredential::ApiKey(value.clone()),
+            RuntimeCredential::OAuth { profile, .. } => WsCredential::OAuth {
+                profile: profile.clone(),
+            },
+        }
+    }
+}
+
+async fn resolve_runtime(
+    store: &ConfigStore,
+    cli_api_key: Option<&str>,
+    cli_http_base_url: Option<&str>,
+    cli_ws_url: Option<&str>,
+    cli_client_id: Option<&str>,
+) -> Result<RuntimeConfig> {
+    let stored_config = store.load_config()?;
+    let stored_auth = store.load_auth()?;
+    let active_profile = stored_auth.as_ref().and_then(|auth| {
+        auth.active_profile
+            .as_ref()
+            .and_then(|name| auth.profiles.get(name))
+    });
+    if let (Some(profile), Some(override_url)) = (active_profile, cli_http_base_url)
+        && profile.credential_store_account.is_some()
+        && auth_login::validate_api_base_url(override_url)?
+            != auth_login::validate_api_base_url(&profile.api_base_url)?
+    {
+        anyhow::bail!(
+            "OAuth profiles are bound to their Disc API origin; log in separately for the requested endpoint."
+        );
+    }
+    if cli_api_key.is_some_and(|value| !value.is_empty())
+        && active_profile.is_some_and(|profile| profile.credential_store_account.is_some())
+    {
+        anyhow::bail!(
+            "An explicit API key cannot be combined with an active OAuth profile; log out or select a manual profile."
+        );
+    }
+    let credential = if let Some(value) = cli_api_key.filter(|value| !value.is_empty()) {
+        RuntimeCredential::ApiKey(value.to_owned())
+    } else if let Some(profile) = active_profile.filter(|profile| !profile.api_key.is_empty()) {
+        RuntimeCredential::ApiKey(profile.api_key.clone())
+    } else if let Some(profile) = active_profile {
+        let oauth = auth_login::runtime_oauth(profile).await?;
+        RuntimeCredential::OAuth {
+            access_token: oauth.access_token,
+            subject_context_token: oauth.subject_context_token,
+            profile: Box::new(profile.clone()),
+        }
+    } else {
+        anyhow::bail!(
+            "Authentication is not configured. Run `disc auth login`, `disc auth api-key set`, or pass `--api-key`."
+        );
+    };
+    Ok(RuntimeConfig {
+        credential,
+        http_base_url: cli_http_base_url
+            .map(str::to_owned)
+            .or_else(|| active_profile.map(|profile| profile.api_base_url.clone()))
+            .or(stored_config.http_base_url)
+            .unwrap_or_else(|| "https://api.disc.tech".to_owned()),
+        ws_url: cli_ws_url
+            .map(str::to_owned)
+            .or(stored_config.ws_url)
+            .unwrap_or_else(|| "wss://signals.disc.tech".to_owned()),
+        client_id: cli_client_id
+            .map(str::to_owned)
+            .or(stored_config.client_id)
+            .filter(|value| !value.is_empty()),
+    })
+}
 
 struct ReconcileSubscriptionContext<'a> {
     writer: &'a SharedWriter,
     ws_url: &'a str,
-    api_key: &'a str,
+    credential: &'a WsCredential,
     client_id: Option<&'a str>,
     options: &'a StreamOptions,
     format: crate::cli::StreamOutputFormat,
@@ -193,8 +299,27 @@ async fn run_auth(
     match command {
         AuthCommand::Login {
             no_browser,
+            issuer,
+            oauth_client_id,
+            profile,
             machine_label,
-        } => auth_login::login(store, http_base_url, machine_label, no_browser).await,
+            subject,
+            device,
+        } => {
+            auth_login::login(
+                store,
+                auth_login::LoginOptions {
+                    api_base_url: http_base_url,
+                    issuer,
+                    oauth_client_id,
+                    requested_profile: profile.or(machine_label),
+                    requested_subject: subject,
+                    device,
+                    no_browser,
+                },
+            )
+            .await
+        }
         AuthCommand::List => {
             let Some(auth) = store.load_auth()? else {
                 println!("No stored Disc auth profiles.");
@@ -245,24 +370,51 @@ async fn run_auth(
                     subject_kind: None,
                     display_name: Some("Manual API key".to_owned()),
                     created_at: None,
+                    issuer: None,
+                    oauth_client_id: None,
+                    keycloak_user_id: None,
+                    credential_store_account: None,
                 })?;
                 println!("Stored API key in {}.", store.root_dir().display());
                 Ok(())
             }
         },
         AuthCommand::Whoami { format } => {
-            let effective = store.resolve(
+            let effective = resolve_runtime(
+                store,
                 api_key.as_deref(),
                 http_base_url.as_deref(),
                 ws_url.as_deref(),
                 client_id.as_deref(),
-            )?;
-            let client = DiscApiClient::new(effective.http_base_url, &effective.api_key)?;
+            )
+            .await?;
+            let client =
+                DiscApiClient::new(effective.http_base_url.clone(), effective.http_credential())?;
             let response = client.validate().await?;
             let json = validate_to_json(&response);
             print_json_value(&json, format)
         }
         AuthCommand::Clear { all } => {
+            if let Some(auth) = store.load_auth()? {
+                let selected_profiles: Vec<_> = if all {
+                    auth.profiles.values().collect()
+                } else {
+                    auth.active_profile
+                        .as_ref()
+                        .and_then(|name| auth.profiles.get(name))
+                        .into_iter()
+                        .collect()
+                };
+                if selected_profiles
+                    .iter()
+                    .any(|profile| profile.credential_store_account.is_some())
+                {
+                    anyhow::bail!(
+                        "OAuth profiles must be remotely revoked with `disc auth logout{}` before local removal.",
+                        if all { " --all" } else { "" }
+                    );
+                }
+            }
             let removed = if all {
                 store.clear_auth()?
             } else {
@@ -280,6 +432,40 @@ async fn run_auth(
             } else {
                 println!("No stored Disc auth profile to clear.");
             }
+            Ok(())
+        }
+        AuthCommand::Logout { all } => {
+            let Some(auth) = store.load_auth()? else {
+                println!("No stored Disc auth profile to log out.");
+                return Ok(());
+            };
+            let profiles: Vec<_> = if all {
+                auth.profiles.values().cloned().collect()
+            } else {
+                auth.active_profile
+                    .as_ref()
+                    .and_then(|name| auth.profiles.get(name))
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            };
+            let mut failures = Vec::new();
+            for profile in &profiles {
+                match auth_login::logout(profile).await {
+                    Ok(()) => {
+                        store.remove_profile(&profile.profile)?;
+                    }
+                    Err(error) => failures.push(format!("{}: {error}", profile.profile)),
+                }
+            }
+            if !failures.is_empty() {
+                anyhow::bail!(
+                    "Failed to revoke {} OAuth profile(s); their local credentials were preserved: {}",
+                    failures.len(),
+                    failures.join("; ")
+                );
+            }
+            println!("Disc OAuth session revoked.");
             Ok(())
         }
     }
@@ -334,20 +520,23 @@ async fn run_signals(
     client_id: Option<String>,
     store: &ConfigStore,
 ) -> Result<()> {
-    let effective = store.resolve(
+    let effective = resolve_runtime(
+        store,
         api_key.as_deref(),
         http_base_url.as_deref(),
         ws_url.as_deref(),
         client_id.as_deref(),
-    )?;
-    let client = DiscApiClient::new(effective.http_base_url.clone(), &effective.api_key)?;
+    )
+    .await?;
+    let client = DiscApiClient::new(effective.http_base_url.clone(), effective.http_credential())?;
+    let ws_credential = effective.ws_credential();
 
     match command {
         SignalsCommand::Subscribe(command) => {
             run_interactive_subscribe(
                 &client,
                 &effective.ws_url,
-                &effective.api_key,
+                &ws_credential,
                 effective.client_id.as_deref(),
                 &command,
             )
@@ -369,7 +558,7 @@ async fn run_signals(
                 run_stream_command(
                     SubscriptionKind::Passive,
                     &effective.ws_url,
-                    &effective.api_key,
+                    &ws_credential,
                     effective.client_id.as_deref(),
                     &command,
                 )
@@ -379,7 +568,7 @@ async fn run_signals(
                 run_tail_command(
                     SubscriptionKind::Passive,
                     &effective.ws_url,
-                    &effective.api_key,
+                    &ws_credential,
                     effective.client_id.as_deref(),
                     &command,
                 )
@@ -405,7 +594,7 @@ async fn run_signals(
                 run_stream_command(
                     SubscriptionKind::Active,
                     &effective.ws_url,
-                    &effective.api_key,
+                    &ws_credential,
                     effective.client_id.as_deref(),
                     &command,
                 )
@@ -415,7 +604,7 @@ async fn run_signals(
                 run_tail_command(
                     SubscriptionKind::Active,
                     &effective.ws_url,
-                    &effective.api_key,
+                    &ws_credential,
                     effective.client_id.as_deref(),
                     &command,
                 )
@@ -428,7 +617,7 @@ async fn run_signals(
 async fn run_stream_command(
     kind: SubscriptionKind,
     ws_url: &str,
-    api_key: &str,
+    credential: &WsCredential,
     client_id: Option<&str>,
     command: &StreamCommand,
 ) -> Result<()> {
@@ -443,7 +632,7 @@ async fn run_stream_command(
 
     run_subscription(
         ws_url,
-        api_key,
+        credential,
         client_id,
         &spec,
         &command.options,
@@ -465,7 +654,7 @@ async fn run_stream_command(
 async fn run_tail_command(
     kind: SubscriptionKind,
     ws_url: &str,
-    api_key: &str,
+    credential: &WsCredential,
     client_id: Option<&str>,
     command: &TailCommand,
 ) -> Result<()> {
@@ -476,34 +665,43 @@ async fn run_tail_command(
     };
     let options = stream_options_from_tail(command);
 
-    run_subscription(ws_url, api_key, client_id, &spec, &options, true, |event| {
-        if should_emit_event(&event, options.output) {
-            write_subscription_event(&writer, &event, command.format)?;
-            if options.once {
-                return Ok(true);
+    run_subscription(
+        ws_url,
+        credential,
+        client_id,
+        &spec,
+        &options,
+        true,
+        |event| {
+            if should_emit_event(&event, options.output) {
+                write_subscription_event(&writer, &event, command.format)?;
+                if options.once {
+                    return Ok(true);
+                }
             }
-        }
 
-        Ok(false)
-    })
+            Ok(false)
+        },
+    )
     .await
 }
 
 async fn run_interactive_subscribe(
     client: &DiscApiClient,
     ws_url: &str,
-    api_key: &str,
+    credential: &WsCredential,
     client_id: Option<&str>,
     command: &InteractiveSubscribeCommand,
 ) -> Result<()> {
     let mut prompts = DialoguerSubscriptionPrompts::new();
-    run_interactive_subscribe_with(client, ws_url, api_key, client_id, command, &mut prompts).await
+    run_interactive_subscribe_with(client, ws_url, credential, client_id, command, &mut prompts)
+        .await
 }
 
 async fn run_interactive_subscribe_with(
     client: &DiscApiClient,
     ws_url: &str,
-    api_key: &str,
+    credential: &WsCredential,
     client_id: Option<&str>,
     command: &InteractiveSubscribeCommand,
     prompts: &mut DialoguerSubscriptionPrompts,
@@ -562,7 +760,7 @@ async fn run_interactive_subscribe_with(
                     ReconcileSubscriptionContext {
                         writer: &writer,
                         ws_url,
-                        api_key,
+                        credential,
                         client_id,
                         options: &command.options,
                         format: command.format,
@@ -589,7 +787,7 @@ async fn run_interactive_subscribe_with(
             ReconcileSubscriptionContext {
                 writer: &writer,
                 ws_url,
-                api_key,
+                credential,
                 client_id,
                 options: &command.options,
                 format: command.format,
@@ -639,7 +837,7 @@ fn reconcile_subscriptions(
 
         let writer = context.writer.clone();
         let ws_url = context.ws_url.to_owned();
-        let api_key = context.api_key.to_owned();
+        let credential = context.credential.clone();
         let client_id = context.client_id.map(str::to_owned);
         let options = context.options.clone();
         let format = context.format;
@@ -647,7 +845,7 @@ fn reconcile_subscriptions(
         let task = tokio::spawn(async move {
             let _ = run_subscription(
                 &ws_url,
-                &api_key,
+                &credential,
                 client_id.as_deref(),
                 &spec_for_task,
                 &options,
@@ -914,15 +1112,15 @@ mod tests {
     use crate::config::{ConfigStore, StoredConfig};
     use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
     use crate::output::SharedWriter;
-    use crate::ws::{SubscriptionKind, SubscriptionSpec};
+    use crate::ws::{SubscriptionKind, SubscriptionSpec, WsCredential};
 
     use super::{
         DialoguerSubscriptionPrompts, InteractiveAction, ReconcileSubscriptionContext,
         abort_all_tasks, active_selection_options, merge_active_signal_selection,
         passive_selection_options, print_subscription_summary, reconcile_subscriptions,
-        resolve_api_key_input, run_auth, run_config, run_interactive_subscribe_with, run_signals,
-        run_with_store, selected_passive_signal_ids, stream_options_from_tail,
-        strip_ansi_sequences, validate_api_key,
+        resolve_api_key_input, resolve_runtime, run_auth, run_config,
+        run_interactive_subscribe_with, run_signals, run_with_store, selected_passive_signal_ids,
+        stream_options_from_tail, strip_ansi_sequences, validate_api_key,
     };
 
     fn temporary_root(test_name: &str) -> PathBuf {
@@ -1176,6 +1374,237 @@ mod tests {
         .await
         .expect("clear absent auth");
         fs::remove_dir_all(root).expect("remove auth root");
+    }
+
+    #[tokio::test]
+    async fn runtime_resolution_enforces_credential_precedence_and_oauth_origin_binding() {
+        let root = temporary_root("runtime-resolution");
+        let store = ConfigStore::at_root(root.clone());
+
+        let missing = resolve_runtime(&store, None, None, None, None)
+            .await
+            .err()
+            .expect("missing auth");
+        assert!(
+            missing
+                .to_string()
+                .contains("Authentication is not configured")
+        );
+
+        let explicit = resolve_runtime(
+            &store,
+            Some("explicit-key"),
+            Some("http://127.0.0.1:3001"),
+            Some("ws://127.0.0.1:3002"),
+            Some("client-one"),
+        )
+        .await
+        .expect("explicit API key");
+        assert_eq!(explicit.http_base_url, "http://127.0.0.1:3001");
+        assert_eq!(explicit.ws_url, "ws://127.0.0.1:3002");
+        assert_eq!(explicit.client_id.as_deref(), Some("client-one"));
+        assert!(matches!(
+            explicit.http_credential(),
+            crate::http::HttpCredential::ApiKey("explicit-key")
+        ));
+        assert!(matches!(
+            explicit.ws_credential(),
+            WsCredential::ApiKey(value) if value == "explicit-key"
+        ));
+
+        store
+            .save_profile(crate::config::StoredAuthProfile {
+                profile: "manual".to_owned(),
+                api_key: "stored-key".to_owned(),
+                api_base_url: "https://api.disc.tech".to_owned(),
+                subject_id: None,
+                subject_key: None,
+                subject_kind: None,
+                display_name: Some("Manual API key".to_owned()),
+                created_at: None,
+                issuer: None,
+                oauth_client_id: None,
+                keycloak_user_id: None,
+                credential_store_account: None,
+            })
+            .expect("save manual profile");
+        let stored = resolve_runtime(&store, None, None, None, None)
+            .await
+            .expect("stored API key");
+        assert!(matches!(
+            stored.http_credential(),
+            crate::http::HttpCredential::ApiKey("stored-key")
+        ));
+
+        store
+            .save_profile(crate::config::StoredAuthProfile {
+                profile: "oauth".to_owned(),
+                api_key: String::new(),
+                api_base_url: "https://api.disc.tech".to_owned(),
+                subject_id: Some("42".to_owned()),
+                subject_key: Some("partner".to_owned()),
+                subject_kind: Some("PARTNER".to_owned()),
+                display_name: Some("Partner".to_owned()),
+                created_at: None,
+                issuer: Some("https://sso.disc.tech/realms/disc".to_owned()),
+                oauth_client_id: Some("disc-cli".to_owned()),
+                keycloak_user_id: Some("user-42".to_owned()),
+                credential_store_account: Some("credential-account".to_owned()),
+            })
+            .expect("save OAuth profile");
+        let ambiguous = resolve_runtime(&store, Some("explicit-key"), None, None, None)
+            .await
+            .err()
+            .expect("ambiguous credentials");
+        assert!(ambiguous.to_string().contains("cannot be combined"));
+        let rebound = resolve_runtime(&store, None, Some("https://other.example"), None, None)
+            .await
+            .err()
+            .expect("origin rebinding");
+        assert!(
+            rebound
+                .to_string()
+                .contains("bound to their Disc API origin")
+        );
+
+        fs::remove_dir_all(root).expect("remove runtime root");
+    }
+
+    #[tokio::test]
+    async fn auth_profile_management_lists_switches_and_refuses_local_oauth_deletion() {
+        let root = temporary_root("profile-management");
+        let store = ConfigStore::at_root(root.clone());
+        assert!(
+            run_auth(
+                AuthCommand::Login {
+                    no_browser: true,
+                    issuer: None,
+                    oauth_client_id: None,
+                    profile: None,
+                    machine_label: None,
+                    subject: None,
+                    device: false,
+                },
+                None,
+                Some("http://api.disc.tech".to_owned()),
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect_err("unsafe login API origin")
+            .to_string()
+            .contains("must use HTTPS")
+        );
+        run_auth(AuthCommand::List, None, None, None, None, &store)
+            .await
+            .expect("list absent profiles");
+        run_auth(
+            AuthCommand::Logout { all: false },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("logout absent profile");
+
+        for (name, oauth) in [("manual", false), ("oauth", true)] {
+            store
+                .save_profile(crate::config::StoredAuthProfile {
+                    profile: name.to_owned(),
+                    api_key: if oauth {
+                        String::new()
+                    } else {
+                        "stored-key".to_owned()
+                    },
+                    api_base_url: "https://api.disc.tech".to_owned(),
+                    subject_id: oauth.then(|| "42".to_owned()),
+                    subject_key: oauth.then(|| "partner".to_owned()),
+                    subject_kind: oauth.then(|| "PARTNER".to_owned()),
+                    display_name: Some(if oauth { "Partner" } else { "Manual API key" }.to_owned()),
+                    created_at: None,
+                    issuer: oauth.then(|| "https://sso.disc.tech/realms/disc".to_owned()),
+                    oauth_client_id: oauth.then(|| "disc-cli".to_owned()),
+                    keycloak_user_id: oauth.then(|| "user-42".to_owned()),
+                    credential_store_account: oauth.then(|| "credential-account".to_owned()),
+                })
+                .expect("save profile");
+        }
+
+        run_auth(AuthCommand::List, None, None, None, None, &store)
+            .await
+            .expect("list profiles");
+        run_auth(
+            AuthCommand::Use {
+                profile: "manual".to_owned(),
+            },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("select manual profile");
+        run_auth(
+            AuthCommand::Clear { all: false },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("clear manual profile");
+        assert!(
+            run_auth(
+                AuthCommand::Clear { all: true },
+                None,
+                None,
+                None,
+                None,
+                &store,
+            )
+            .await
+            .expect_err("OAuth clear must be refused")
+            .to_string()
+            .contains("remotely revoked")
+        );
+
+        store.remove_profile("oauth").expect("remove OAuth fixture");
+        for name in ["manual-one", "manual-two"] {
+            store
+                .save_profile(crate::config::StoredAuthProfile {
+                    profile: name.to_owned(),
+                    api_key: "stored-key".to_owned(),
+                    api_base_url: "https://api.disc.tech".to_owned(),
+                    subject_id: None,
+                    subject_key: None,
+                    subject_kind: None,
+                    display_name: Some("Manual API key".to_owned()),
+                    created_at: None,
+                    issuer: None,
+                    oauth_client_id: None,
+                    keycloak_user_id: None,
+                    credential_store_account: None,
+                })
+                .expect("save logout fixture");
+        }
+        run_auth(
+            AuthCommand::Logout { all: true },
+            None,
+            None,
+            None,
+            None,
+            &store,
+        )
+        .await
+        .expect("logout all local-only profiles");
+        assert!(store.load_auth().expect("load auth").is_none());
+
+        fs::remove_dir_all(root).expect("remove profile root");
     }
 
     #[tokio::test]
@@ -1510,7 +1939,7 @@ mod tests {
         run_interactive_subscribe_with(
             &client,
             "ws://127.0.0.1:1",
-            "test-key",
+            &WsCredential::ApiKey("test-key".to_owned()),
             Some("client-one"),
             &command,
             &mut prompts,
@@ -1549,7 +1978,7 @@ mod tests {
         run_interactive_subscribe_with(
             &empty_client,
             "ws://127.0.0.1:1",
-            "test-key",
+            &WsCredential::ApiKey("test-key".to_owned()),
             None,
             &empty_command,
             &mut empty_prompts,
@@ -1588,7 +2017,7 @@ mod tests {
         run_interactive_subscribe_with(
             &no_active_client,
             "ws://127.0.0.1:1",
-            "test-key",
+            &WsCredential::ApiKey("test-key".to_owned()),
             None,
             &no_active_command,
             &mut no_active_prompts,
@@ -1636,13 +2065,14 @@ mod tests {
         let mut tasks = HashMap::new();
         let passive_ids = HashSet::from(["passive-one".to_owned()]);
         let active_ids = HashSet::from(["active-one".to_owned()]);
+        let credential = WsCredential::ApiKey("test-key".to_owned());
 
         reconcile_subscriptions(
             &mut tasks,
             ReconcileSubscriptionContext {
                 writer: &writer,
                 ws_url: "ws://127.0.0.1:1",
-                api_key: "test-key",
+                credential: &credential,
                 client_id: Some("client-one"),
                 options: &options,
                 format: StreamOutputFormat::Ndjson,
@@ -1665,7 +2095,7 @@ mod tests {
             ReconcileSubscriptionContext {
                 writer: &writer,
                 ws_url: "ws://127.0.0.1:1",
-                api_key: "test-key",
+                credential: &credential,
                 client_id: None,
                 options: &options,
                 format: StreamOutputFormat::Pretty,

@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const QUALIFIER: &str = "tech";
 const ORGANIZATION: &str = "disctech";
 const APPLICATION: &str = "disc";
+const AUTH_SCHEMA_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredConfig {
@@ -28,6 +30,14 @@ pub struct StoredAuthProfile {
     pub subject_kind: Option<String>,
     pub display_name: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    pub keycloak_user_id: Option<String>,
+    #[serde(default)]
+    pub credential_store_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,6 +47,7 @@ pub struct StoredAuth {
     pub profiles: BTreeMap<String, StoredAuthProfile>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub api_key: String,
@@ -69,6 +80,17 @@ impl ConfigStore {
         &self.root_dir
     }
 
+    pub fn credential_lock_path(&self, account: &str) -> Result<PathBuf> {
+        self.ensure_dir()?;
+        let digest = Sha256::digest(account.as_bytes());
+        let name = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        Ok(self.root_dir.join(format!(".oauth-{name}.lock")))
+    }
+
     #[cfg(test)]
     pub(crate) fn at_root(root_dir: PathBuf) -> Self {
         Self { root_dir }
@@ -89,14 +111,22 @@ impl ConfigStore {
             return Ok(None);
         }
 
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}.", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).context(format!("Failed to read {}.", path.display()))?;
         let value = serde_json::from_str::<serde_json::Value>(&raw)
-            .with_context(|| format!("Failed to parse {}.", path.display()))?;
+            .context(format!("Failed to parse {}.", path.display()))?;
 
         if value.get("version").is_some() {
-            let auth = serde_json::from_value::<StoredAuth>(value)
-                .with_context(|| format!("Failed to parse {}.", path.display()))?;
+            let mut auth = serde_json::from_value::<StoredAuth>(value)
+                .context(format!("Failed to parse {}.", path.display()))?;
+            if auth.version > AUTH_SCHEMA_VERSION {
+                bail!(
+                    "Stored Disc credentials use unsupported schema version {} (this CLI supports up to {}).",
+                    auth.version,
+                    AUTH_SCHEMA_VERSION
+                );
+            }
+            auth.version = AUTH_SCHEMA_VERSION;
             return Ok(Some(auth));
         }
 
@@ -104,7 +134,7 @@ impl ConfigStore {
             .get("api_key")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
-            .with_context(|| {
+            .context({
                 format!(
                     "Stored legacy Disc credentials in {} are missing api_key.",
                     path.display()
@@ -123,10 +153,14 @@ impl ConfigStore {
             subject_kind: None,
             display_name: Some("Legacy API key".to_owned()),
             created_at: None,
+            issuer: None,
+            oauth_client_id: None,
+            keycloak_user_id: None,
+            credential_store_account: None,
         };
 
         Ok(Some(StoredAuth {
-            version: 2,
+            version: AUTH_SCHEMA_VERSION,
             active_profile: Some(profile.profile.clone()),
             profiles: BTreeMap::from([(profile.profile.clone(), profile)]),
         }))
@@ -138,10 +172,10 @@ impl ConfigStore {
 
     pub fn save_profile(&self, profile: StoredAuthProfile) -> Result<()> {
         let mut auth = self.load_auth()?.unwrap_or_else(|| StoredAuth {
-            version: 2,
+            version: AUTH_SCHEMA_VERSION,
             ..StoredAuth::default()
         });
-        auth.version = 2;
+        auth.version = AUTH_SCHEMA_VERSION;
         auth.active_profile = Some(profile.profile.clone());
         auth.profiles.insert(profile.profile.clone(), profile);
         self.save_auth(&auth)
@@ -172,17 +206,36 @@ impl ConfigStore {
         Ok(removed)
     }
 
+    pub fn remove_profile(&self, profile: &str) -> Result<bool> {
+        let Some(mut auth) = self.load_auth()? else {
+            return Ok(false);
+        };
+        let removed = auth.profiles.remove(profile).is_some();
+        if !removed {
+            return Ok(false);
+        }
+        if auth.active_profile.as_deref() == Some(profile) {
+            auth.active_profile = auth.profiles.keys().next().cloned();
+        }
+        if auth.profiles.is_empty() {
+            return self.clear_auth();
+        }
+        self.save_auth(&auth)?;
+        Ok(true)
+    }
+
     pub fn clear_auth(&self) -> Result<bool> {
         let path = self.root_dir.join("auth.json");
         if path.exists() {
             fs::remove_file(&path)
-                .with_context(|| format!("Failed to remove auth file at {}.", path.display()))?;
+                .context(format!("Failed to remove auth file at {}.", path.display()))?;
             return Ok(true);
         }
 
         Ok(false)
     }
 
+    #[cfg(test)]
     pub fn resolve(
         &self,
         cli_api_key: Option<&str>,
@@ -231,7 +284,7 @@ impl ConfigStore {
     }
 
     fn ensure_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.root_dir).with_context(|| {
+        fs::create_dir_all(&self.root_dir).context({
             format!(
                 "Failed to create Disc CLI config directory at {}.",
                 self.root_dir.display()
@@ -249,10 +302,10 @@ impl ConfigStore {
             return Ok(None);
         }
 
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}.", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).context(format!("Failed to read {}.", path.display()))?;
         let parsed = serde_json::from_str::<T>(&raw)
-            .with_context(|| format!("Failed to parse {}.", path.display()))?;
+            .context(format!("Failed to parse {}.", path.display()))?;
         Ok(Some(parsed))
     }
 
@@ -264,7 +317,7 @@ impl ConfigStore {
 
         let path = self.root_dir.join(name);
         let json = serde_json::to_vec_pretty(value)
-            .with_context(|| format!("Failed to serialize {}.", path.display()))?;
+            .context(format!("Failed to serialize {}.", path.display()))?;
 
         #[cfg(unix)]
         {
@@ -279,19 +332,19 @@ impl ConfigStore {
                 .truncate(true)
                 .mode(0o600)
                 .open(&temporary_path)
-                .with_context(|| {
+                .context({
                     format!(
                         "Failed to open temporary credential file in {}.",
                         self.root_dir.display()
                     )
                 })?;
             file.write_all(&json)
-                .with_context(|| format!("Failed to write {}.", temporary_path.display()))?;
+                .context(format!("Failed to write {}.", temporary_path.display()))?;
             file.write_all(b"\n")
-                .with_context(|| format!("Failed to finalize {}.", temporary_path.display()))?;
+                .context(format!("Failed to finalize {}.", temporary_path.display()))?;
             file.sync_all()
-                .with_context(|| format!("Failed to sync {}.", temporary_path.display()))?;
-            fs::rename(&temporary_path, &path).with_context(|| {
+                .context(format!("Failed to sync {}.", temporary_path.display()))?;
+            fs::rename(&temporary_path, &path).context({
                 format!(
                     "Failed to atomically replace credentials at {}.",
                     path.display()
@@ -303,9 +356,9 @@ impl ConfigStore {
         #[cfg(not(unix))]
         {
             let serialized = serde_json::to_string_pretty(value)
-                .with_context(|| format!("Failed to serialize {}.", path.display()))?;
+                .context(format!("Failed to serialize {}.", path.display()))?;
             fs::write(&path, format!("{serialized}\n"))
-                .with_context(|| format!("Failed to write {}.", path.display()))?;
+                .context(format!("Failed to write {}.", path.display()))?;
             Ok(())
         }
     }
@@ -317,7 +370,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{ConfigStore, StoredAuth, StoredAuthProfile, StoredConfig};
+    use super::{AUTH_SCHEMA_VERSION, ConfigStore, StoredAuth, StoredAuthProfile, StoredConfig};
 
     fn stored_auth(api_key: &str) -> StoredAuth {
         let profile = StoredAuthProfile {
@@ -329,9 +382,13 @@ mod tests {
             subject_kind: None,
             display_name: None,
             created_at: None,
+            issuer: None,
+            oauth_client_id: None,
+            keycloak_user_id: None,
+            credential_store_account: None,
         };
         StoredAuth {
-            version: 2,
+            version: AUTH_SCHEMA_VERSION,
             active_profile: Some(profile.profile.clone()),
             profiles: [(profile.profile.clone(), profile)].into(),
         }
@@ -520,7 +577,7 @@ mod tests {
         .expect("write legacy auth");
 
         let auth = store.load_auth().expect("load legacy auth").expect("auth");
-        assert_eq!(auth.version, 2);
+        assert_eq!(auth.version, AUTH_SCHEMA_VERSION);
         assert_eq!(auth.active_profile.as_deref(), Some("legacy"));
         assert_eq!(auth.profiles["legacy"].api_key, "legacy-secret");
         assert_eq!(
@@ -528,6 +585,82 @@ mod tests {
             "https://legacy.example.test"
         );
         assert!(auth.profiles["legacy"].subject_id.is_none());
+        remove_store(&store);
+    }
+
+    #[test]
+    fn version_two_profiles_migrate_without_inventing_oauth_credentials() {
+        let store = temporary_store("v2-migration");
+        fs::create_dir_all(&store.root_dir).expect("create config directory");
+        fs::write(
+            store.root_dir.join("auth.json"),
+            r#"{
+              "version": 2,
+              "active_profile": "partner",
+              "profiles": {
+                "partner": {
+                  "profile": "partner",
+                  "api_key": "legacy-api-key",
+                  "api_base_url": "https://api.disc.tech",
+                  "subject_id": "42",
+                  "subject_key": "partner",
+                  "subject_kind": "partner",
+                  "display_name": "Partner",
+                  "created_at": "2026-07-30T00:00:00Z"
+                }
+              }
+            }"#,
+        )
+        .expect("write v2 auth");
+
+        let auth = store.load_auth().expect("load v2 auth").expect("auth");
+        assert_eq!(auth.version, AUTH_SCHEMA_VERSION);
+        let profile = &auth.profiles["partner"];
+        assert_eq!(profile.api_key, "legacy-api-key");
+        assert!(profile.issuer.is_none());
+        assert!(profile.oauth_client_id.is_none());
+        assert!(profile.credential_store_account.is_none());
+        remove_store(&store);
+    }
+
+    #[test]
+    fn future_auth_schema_is_rejected_without_rewriting_the_file() {
+        let store = temporary_store("future-schema");
+        fs::create_dir_all(&store.root_dir).expect("create config directory");
+        let path = store.root_dir.join("auth.json");
+        let original = r#"{"version":255,"active_profile":null,"profiles":{}}"#;
+        fs::write(&path, original).expect("write future auth");
+
+        let error = store.load_auth().expect_err("future schema must fail");
+        assert!(error.to_string().contains("unsupported schema version 255"));
+        assert_eq!(
+            fs::read_to_string(path).expect("read unchanged auth"),
+            original
+        );
+        remove_store(&store);
+    }
+
+    #[test]
+    fn credential_lock_names_are_deterministic_and_do_not_expose_account_ids() {
+        let store = temporary_store("credential-lock");
+        let first = store
+            .credential_lock_path("issuer:user:subject")
+            .expect("lock path");
+        let second = store
+            .credential_lock_path("issuer:user:subject")
+            .expect("lock path");
+        let other = store
+            .credential_lock_path("issuer:user:other-subject")
+            .expect("other lock path");
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        let name = first
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("lock filename");
+        assert!(name.starts_with(".oauth-"));
+        assert!(!name.contains("issuer"));
+        assert!(!name.contains("subject"));
         remove_store(&store);
     }
 
@@ -559,6 +692,27 @@ mod tests {
         assert_eq!(auth.active_profile.as_deref(), Some("second"));
         assert!(!auth.profiles.contains_key("first"));
         assert_eq!(auth.profiles["second"].api_key, "second-key");
+        remove_store(&store);
+    }
+
+    #[test]
+    fn named_profile_removal_preserves_failures_and_selects_a_remaining_profile() {
+        let store = temporary_store("named-removal");
+        let mut first = stored_auth("first-key")
+            .profiles
+            .remove("test")
+            .expect("profile");
+        first.profile = "first".to_owned();
+        let mut second = first.clone();
+        second.profile = "second".to_owned();
+        store.save_profile(first).expect("save first");
+        store.save_profile(second).expect("save second");
+
+        assert!(store.remove_profile("second").expect("remove active"));
+        let auth = store.load_auth().expect("load auth").expect("auth");
+        assert_eq!(auth.active_profile.as_deref(), Some("first"));
+        assert!(auth.profiles.contains_key("first"));
+        assert!(!store.remove_profile("missing").expect("remove missing"));
         remove_store(&store);
     }
 

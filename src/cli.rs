@@ -41,7 +41,7 @@ pub enum StreamOutputFilter {
 pub struct Cli {
     #[arg(long, global = true, env = "DISC_API_KEY")]
     pub api_key: Option<String>,
-    #[arg(long, global = true, env = "DISC_HTTP_BASE_URL")]
+    #[arg(long, alias = "api-url", global = true, env = "DISC_HTTP_BASE_URL")]
     pub http_base_url: Option<String>,
     #[arg(long, global = true, env = "DISC_WS_URL")]
     pub ws_url: Option<String>,
@@ -85,7 +85,17 @@ pub enum AuthCommand {
         #[arg(long, default_value_t = false)]
         no_browser: bool,
         #[arg(long)]
+        issuer: Option<String>,
+        #[arg(long)]
+        oauth_client_id: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, hide = true)]
         machine_label: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long, default_value_t = false)]
+        device: bool,
     },
     #[command(about = "List stored subject profiles")]
     List,
@@ -93,11 +103,20 @@ pub enum AuthCommand {
     Use { profile: String },
     #[command(subcommand)]
     ApiKey(ApiKeyCommand),
+    #[command(
+        alias = "status",
+        about = "Show the active authenticated identity and subject"
+    )]
     Whoami {
         #[arg(long, value_enum, default_value_t = JsonOutputFormat::Json)]
         format: JsonOutputFormat,
     },
     Clear {
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    #[command(about = "Revoke OAuth credentials and remove stored profiles")]
+    Logout {
         #[arg(long, default_value_t = false)]
         all: bool,
     },

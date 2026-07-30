@@ -6,7 +6,7 @@ on:
     - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -18,10 +18,16 @@ jobs:
         include:
         - os: macos-14
           target: aarch64-apple-darwin
-        # - os: macos-13
-        #   target: x86_64-apple-darwin
+          binary: ./target/release/disc
+        - os: macos-15-intel
+          target: x86_64-apple-darwin
+          binary: ./target/release/disc
         - os: ubuntu-24.04
           target: x86_64-unknown-linux-gnu
+          binary: ./target/release/disc
+        - os: windows-2025
+          target: x86_64-pc-windows-msvc
+          binary: ./target/release/disc.exe
 
     steps:
     - uses: actions/checkout@v4
@@ -41,9 +47,10 @@ jobs:
       run: cargo build --locked --release --bin disc
 
     - name: Package release archive
+      shell: bash
       run: |
         ./scripts/package-release.sh \
-          --binary ./target/release/disc \
+          --binary "${{ matrix.binary }}" \
           --target "${{ matrix.target }}" \
           --output-dir ./dist
 
@@ -59,6 +66,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
     - build
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
     - uses: actions/checkout@v4
@@ -87,6 +98,11 @@ jobs:
           --checksums ./dist/SHA256SUMS.txt \
           --output ./dist/disc.rb
 
+    - name: Attest release archives
+      uses: actions/attest@v4
+      with:
+        subject-checksums: ./dist/SHA256SUMS.txt
+
     - name: Publish GitHub release
       uses: softprops/action-gh-release@v2
       with:
@@ -95,6 +111,8 @@ jobs:
         # ./dist/disc-x86_64-apple-darwin.tar.gz
         files: |
           ./dist/disc-aarch64-apple-darwin.tar.gz
+          ./dist/disc-x86_64-apple-darwin.tar.gz
           ./dist/disc-x86_64-unknown-linux-gnu.tar.gz
+          ./dist/disc-x86_64-pc-windows-msvc.tar.gz
           ./dist/SHA256SUMS.txt
           ./dist/disc.rb
