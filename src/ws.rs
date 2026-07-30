@@ -938,6 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_sends_auth_and_targets_then_delivers_data_to_callback() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1032,6 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_timeout_returns_without_waiting_for_server_close() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1078,6 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn subscription_honours_no_reconnect_after_clean_server_close() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

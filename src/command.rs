@@ -1208,6 +1208,7 @@ mod tests {
         format!("http://{address}")
     }
 
+    #[allow(clippy::result_large_err)]
     async fn serve_websocket_data_once() -> (String, JoinHandle<()>) {
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
