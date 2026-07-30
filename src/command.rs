@@ -10,8 +10,8 @@ use tokio::task::JoinHandle;
 use crate::auth_login;
 use crate::cli::{
     ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand,
-    InteractiveSubscribeCommand, PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand,
-    StreamOptions, TailCommand,
+    InteractiveSubscribeCommand, LoginArgs, PassiveSignalsCommand, RootCommand, SignalsCommand,
+    StreamCommand, StreamOptions, TailCommand,
 };
 use crate::config::{ConfigStore, StoredAuthProfile};
 use crate::http::{ActiveSignalSummary, DiscApiClient, HttpCredential, PassiveSignalSummary};
@@ -105,7 +105,7 @@ async fn resolve_runtime(
         }
     } else {
         anyhow::bail!(
-            "Authentication is not configured. Run `disc auth login`, `disc auth api-key set`, or pass `--api-key`."
+            "Authentication is not configured. Run `disc login`, `disc auth api-key set`, or pass `--api-key`."
         );
     };
     Ok(RuntimeConfig {
@@ -278,6 +278,7 @@ async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<()> {
     let client_id = cli.client_id.clone();
 
     match cli.command {
+        RootCommand::Login(args) => run_login(args, http_base_url, store).await,
         RootCommand::Auth(command) => {
             run_auth(command, api_key, http_base_url, ws_url, client_id, store).await
         }
@@ -297,29 +298,7 @@ async fn run_auth(
     store: &ConfigStore,
 ) -> Result<()> {
     match command {
-        AuthCommand::Login {
-            no_browser,
-            issuer,
-            oauth_client_id,
-            profile,
-            machine_label,
-            subject,
-            device,
-        } => {
-            auth_login::login(
-                store,
-                auth_login::LoginOptions {
-                    api_base_url: http_base_url,
-                    issuer,
-                    oauth_client_id,
-                    requested_profile: profile.or(machine_label),
-                    requested_subject: subject,
-                    device,
-                    no_browser,
-                },
-            )
-            .await
-        }
+        AuthCommand::Login(args) => run_login(args, http_base_url, store).await,
         AuthCommand::List => {
             let Some(auth) = store.load_auth()? else {
                 println!("No stored Disc auth profiles.");
@@ -469,6 +448,34 @@ async fn run_auth(
             Ok(())
         }
     }
+}
+
+async fn run_login(
+    LoginArgs {
+        no_browser,
+        issuer,
+        oauth_client_id,
+        profile,
+        machine_label,
+        subject,
+        device,
+    }: LoginArgs,
+    http_base_url: Option<String>,
+    store: &ConfigStore,
+) -> Result<()> {
+    auth_login::login(
+        store,
+        auth_login::LoginOptions {
+            api_base_url: http_base_url,
+            issuer,
+            oauth_client_id,
+            requested_profile: profile.or(machine_label),
+            requested_subject: subject,
+            device,
+            no_browser,
+        },
+    )
+    .await
 }
 
 fn run_config(command: ConfigCommand, store: &ConfigStore) -> Result<()> {
@@ -1105,9 +1112,9 @@ mod tests {
 
     use crate::cli::{
         ActiveSignalsCommand, ApiKeyCommand, AuthCommand, Cli, ConfigCommand,
-        InteractiveSubscribeCommand, JsonOutputFormat, ListOutputFormat, PassiveSignalsCommand,
-        RootCommand, SignalsCommand, StreamCommand, StreamOptions, StreamOutputFilter,
-        StreamOutputFormat, TailCommand, WindowSemantics,
+        InteractiveSubscribeCommand, JsonOutputFormat, ListOutputFormat, LoginArgs,
+        PassiveSignalsCommand, RootCommand, SignalsCommand, StreamCommand, StreamOptions,
+        StreamOutputFilter, StreamOutputFormat, TailCommand, WindowSemantics,
     };
     use crate::config::{ConfigStore, StoredConfig};
     use crate::http::{ActiveSignalSummary, DiscApiClient, PassiveSignalSummary};
@@ -1477,7 +1484,7 @@ mod tests {
         let store = ConfigStore::at_root(root.clone());
         assert!(
             run_auth(
-                AuthCommand::Login {
+                AuthCommand::Login(LoginArgs {
                     no_browser: true,
                     issuer: None,
                     oauth_client_id: None,
@@ -1485,7 +1492,7 @@ mod tests {
                     machine_label: None,
                     subject: None,
                     device: false,
-                },
+                }),
                 None,
                 Some("http://api.disc.tech".to_owned()),
                 None,

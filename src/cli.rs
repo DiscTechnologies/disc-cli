@@ -53,12 +53,32 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum RootCommand {
+    #[command(about = "Sign in through your browser")]
+    Login(LoginArgs),
     #[command(subcommand)]
     Auth(AuthCommand),
     #[command(subcommand)]
     Config(ConfigCommand),
     #[command(subcommand)]
     Signals(SignalsCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    #[arg(long, default_value_t = false)]
+    pub no_browser: bool,
+    #[arg(long)]
+    pub issuer: Option<String>,
+    #[arg(long)]
+    pub oauth_client_id: Option<String>,
+    #[arg(long)]
+    pub profile: Option<String>,
+    #[arg(long, hide = true)]
+    pub machine_label: Option<String>,
+    #[arg(long)]
+    pub subject: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub device: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,22 +101,7 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     #[command(about = "Sign in through your browser")]
-    Login {
-        #[arg(long, default_value_t = false)]
-        no_browser: bool,
-        #[arg(long)]
-        issuer: Option<String>,
-        #[arg(long)]
-        oauth_client_id: Option<String>,
-        #[arg(long)]
-        profile: Option<String>,
-        #[arg(long, hide = true)]
-        machine_label: Option<String>,
-        #[arg(long)]
-        subject: Option<String>,
-        #[arg(long, default_value_t = false)]
-        device: bool,
-    },
+    Login(LoginArgs),
     #[command(about = "List stored subject profiles")]
     List,
     #[command(about = "Select a stored subject profile")]
@@ -243,4 +248,53 @@ pub struct InteractiveSubscribeCommand {
     pub format: StreamOutputFormat,
     #[arg(long, default_value = "disc-signals.ndjson")]
     pub destination: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{AuthCommand, Cli, RootCommand};
+
+    #[test]
+    fn login_is_available_as_the_primary_top_level_command() {
+        let cli = Cli::try_parse_from(["disc", "login"]).expect("parse top-level login");
+
+        let RootCommand::Login(args) = cli.command else {
+            panic!("expected top-level login");
+        };
+        assert!(!args.device);
+        assert!(!args.no_browser);
+        assert!(args.issuer.is_none());
+        assert!(args.oauth_client_id.is_none());
+        assert!(args.subject.is_none());
+    }
+
+    #[test]
+    fn nested_auth_login_remains_available_with_advanced_overrides() {
+        let cli = Cli::try_parse_from([
+            "disc",
+            "auth",
+            "login",
+            "--device",
+            "--issuer",
+            "https://sso.example.test/realms/disc",
+            "--oauth-client-id",
+            "disc-cli-test",
+            "--subject",
+            "subject-42",
+        ])
+        .expect("parse nested login");
+
+        let RootCommand::Auth(AuthCommand::Login(args)) = cli.command else {
+            panic!("expected nested auth login");
+        };
+        assert!(args.device);
+        assert_eq!(
+            args.issuer.as_deref(),
+            Some("https://sso.example.test/realms/disc")
+        );
+        assert_eq!(args.oauth_client_id.as_deref(), Some("disc-cli-test"));
+        assert_eq!(args.subject.as_deref(), Some("subject-42"));
+    }
 }

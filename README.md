@@ -9,8 +9,8 @@ Native Rust CLI for **Disc** – discover signals and consume live data streams.
 ```bash
 brew install disctechnologies/tap/disc
 
-# approve this machine in your browser
-disc auth login
+# sign in through your browser
+disc login
 
 # stream a signal
 disc signals passive subscribe <passive-signal-id> --format ndjson
@@ -54,17 +54,23 @@ Sign in through Keycloak with Authorization Code + PKCE. The CLI opens an epheme
 `127.0.0.1` callback and asks you to choose an eligible Disc product subject:
 
 ```bash
-disc auth login
+disc login
 ```
 
 For a remote or headless terminal, use the standard OAuth device flow:
 
 ```bash
-disc auth login --device
+disc login --device
 ```
 
-Use `--no-browser` to print the PKCE authorization URL without launching a browser. Use
-`--subject <id-or-key>` for deterministic non-interactive subject selection.
+With one eligible subject, Disc selects it automatically. With multiple eligible subjects,
+the CLI asks which one to use. Use `--no-browser` to print the PKCE authorization URL without
+launching a browser, or `--subject <id-or-key>` for deterministic non-interactive selection.
+
+Production API, WebSocket, SSO issuer, and OAuth client values are built in. Environment variables
+and command-line options remain available as explicit overrides for local development,
+self-hosting, automation, and debugging. The longer `disc auth login` spelling remains supported
+for compatibility.
 
 Each login creates or replaces one local subject profile. List and switch profiles with:
 
