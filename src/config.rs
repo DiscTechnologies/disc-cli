@@ -256,7 +256,7 @@ impl ConfigStore {
             _ => match active_profile {
                 Some(profile) if !profile.api_key.is_empty() => profile.api_key.clone(),
                 _ => bail!(
-                    "API key is not configured. Run `disc auth login`, `disc auth api-key set`, or pass `--api-key`."
+                    "API key is not configured. Run `disc login`, `disc auth api-key set`, or pass `--api-key`."
                 ),
             },
         };

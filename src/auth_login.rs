@@ -248,6 +248,72 @@ fn safe_oauth_error_code(value: &str) -> String {
     }
 }
 
+fn callback_page(is_success: bool) -> &'static str {
+    if is_success {
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Disc CLI connected</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; overflow: hidden; color: #f5f7fb; background: #07090d; }
+    body::before { content: ""; position: fixed; inset: -25%; background: radial-gradient(circle at 28% 30%, rgba(91, 151, 242, .28), transparent 30%), radial-gradient(circle at 75% 70%, rgba(102, 61, 180, .2), transparent 28%); filter: blur(32px); }
+    main { position: relative; width: min(92vw, 560px); padding: 42px; border: 1px solid rgba(255, 255, 255, .12); border-radius: 18px; background: rgba(18, 21, 28, .88); box-shadow: 0 28px 90px rgba(0, 0, 0, .48); backdrop-filter: blur(18px); }
+    .brand { margin-bottom: 40px; color: #dfe4ed; font-size: 18px; font-weight: 650; letter-spacing: .34em; }
+    .status { width: 52px; height: 52px; display: grid; place-items: center; margin-bottom: 24px; border: 1px solid rgba(110, 211, 158, .4); border-radius: 50%; color: #77dda7; background: rgba(55, 155, 102, .14); font-size: 26px; }
+    h1 { margin: 0 0 12px; font-size: clamp(28px, 5vw, 38px); line-height: 1.12; letter-spacing: -.025em; }
+    p { margin: 0; color: #aeb6c4; font-size: 17px; line-height: 1.6; }
+    .hint { margin-top: 28px; padding-top: 24px; border-top: 1px solid rgba(255, 255, 255, .09); color: #7f8999; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand" aria-label="Disc">DISC</div>
+    <div class="status" aria-hidden="true">✓</div>
+    <h1>CLI connected</h1>
+    <p>Authorization completed successfully. You can return to your terminal and continue using Disc.</p>
+    <p class="hint">This window can now be closed safely.</p>
+  </main>
+</body>
+</html>"#
+    } else {
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Disc CLI authorization cancelled</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; overflow: hidden; color: #f5f7fb; background: #07090d; }
+    body::before { content: ""; position: fixed; inset: -25%; background: radial-gradient(circle at 28% 30%, rgba(91, 151, 242, .2), transparent 30%), radial-gradient(circle at 75% 70%, rgba(180, 61, 92, .18), transparent 28%); filter: blur(32px); }
+    main { position: relative; width: min(92vw, 560px); padding: 42px; border: 1px solid rgba(255, 255, 255, .12); border-radius: 18px; background: rgba(18, 21, 28, .88); box-shadow: 0 28px 90px rgba(0, 0, 0, .48); backdrop-filter: blur(18px); }
+    .brand { margin-bottom: 40px; color: #dfe4ed; font-size: 18px; font-weight: 650; letter-spacing: .34em; }
+    .status { width: 52px; height: 52px; display: grid; place-items: center; margin-bottom: 24px; border: 1px solid rgba(235, 110, 130, .4); border-radius: 50%; color: #f08a9c; background: rgba(176, 55, 78, .14); font-size: 25px; }
+    h1 { margin: 0 0 12px; font-size: clamp(28px, 5vw, 38px); line-height: 1.12; letter-spacing: -.025em; }
+    p { margin: 0; color: #aeb6c4; font-size: 17px; line-height: 1.6; }
+    .hint { margin-top: 28px; padding-top: 24px; border-top: 1px solid rgba(255, 255, 255, .09); color: #7f8999; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand" aria-label="Disc">DISC</div>
+    <div class="status" aria-hidden="true">×</div>
+    <h1>Authorization cancelled</h1>
+    <p>Disc CLI was not connected. Return to your terminal to try again when you are ready.</p>
+    <p class="hint">This window can now be closed safely.</p>
+  </main>
+</body>
+</html>"#
+    }
+}
+
 async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
     let callback = async {
         let (mut stream, peer) = listener
@@ -300,20 +366,14 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
             bail!("OAuth callback used an unexpected Host header.");
         }
         let (code, error) = parse_callback_target(target, expected_state)?;
-        let (status, message) = if error.is_some() {
-            (
-                "400 Bad Request",
-                "Disc CLI authorization was denied. You may close this window.",
-            )
+        let (status, body) = if error.is_some() {
+            ("400 Bad Request", callback_page(false))
         } else {
-            (
-                "200 OK",
-                "Disc CLI authorization completed. You may close this window.",
-            )
+            ("200 OK", callback_page(true))
         };
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{message}",
-            message.len()
+            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\r\n{body}",
+            body.len()
         );
         stream
             .write_all(response.as_bytes())
@@ -778,9 +838,7 @@ async fn refresh_with_store(
     .await?;
     store
         .set_refresh_token(account, tokens.refresh_token.expose_secret())
-        .context(
-            "Failed to persist the rotated OAuth refresh token; run `disc auth login` again.",
-        )?;
+        .context("Failed to persist the rotated OAuth refresh token; run `disc login` again.")?;
     Ok(tokens)
 }
 
@@ -1594,6 +1652,10 @@ mod tests {
             .await
             .expect("response");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(response.contains("Content-Security-Policy: default-src 'none'"));
+        assert!(response.contains("<h1>CLI connected</h1>"));
+        assert!(!response.contains("secret-code"));
         assert_eq!(
             callback
                 .await
@@ -1645,6 +1707,8 @@ mod tests {
             .await
             .expect("denial response");
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("<h1>Authorization cancelled</h1>"));
+        assert!(!response.contains("access_denied"));
         assert!(
             callback
                 .await
