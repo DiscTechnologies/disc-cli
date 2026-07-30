@@ -457,6 +457,7 @@ where
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("scope", "disc-cli")
+        .append_pair("prompt", "consent")
         .append_pair("state", state.secret())
         .append_pair("code_challenge", challenge.as_str())
         .append_pair("code_challenge_method", "S256");
@@ -1790,6 +1791,7 @@ mod tests {
                 let query: HashMap<_, _> = authorization_url.query_pairs().into_owned().collect();
                 assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
                 assert_eq!(query.get("scope").map(String::as_str), Some("disc-cli"));
+                assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
                 assert_eq!(
                     query.get("code_challenge_method").map(String::as_str),
                     Some("S256")
