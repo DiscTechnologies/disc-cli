@@ -1675,7 +1675,6 @@ mod tests {
             "sessionId": null,
             "apiKeyId": "key-one",
             "userId": "user-one",
-            "userType": "SUBJECT",
             "expiresAt": null,
             "revalidateAt": "2026-07-28T12:00:00Z"
         })
