@@ -172,7 +172,6 @@ pub fn validate_to_json(value: &ValidateResponse) -> Value {
         "sessionId": value.session_id,
         "apiKeyId": value.api_key_id,
         "userId": value.user_id,
-        "userType": value.user_type,
         "expiresAt": value.expires_at,
         "revalidateAt": value.revalidate_at,
     })
@@ -410,7 +409,6 @@ mod tests {
             session_id: Some("session-one".to_owned()),
             api_key_id: Some("key-one".to_owned()),
             user_id: "user-one".to_owned(),
-            user_type: "SUBJECT".to_owned(),
             expires_at: None,
             revalidate_at: "2026-07-28T12:00:00Z".to_owned(),
         };
@@ -422,7 +420,6 @@ mod tests {
                 "sessionId": "session-one",
                 "apiKeyId": "key-one",
                 "userId": "user-one",
-                "userType": "SUBJECT",
                 "expiresAt": null,
                 "revalidateAt": "2026-07-28T12:00:00Z"
             })

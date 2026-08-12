@@ -40,8 +40,6 @@ pub struct ValidateResponse {
     pub api_key_id: Option<String>,
     #[serde(rename = "userId")]
     pub user_id: String,
-    #[serde(rename = "userType")]
-    pub user_type: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: Option<String>,
     #[serde(rename = "revalidateAt")]
@@ -282,7 +280,6 @@ mod tests {
             "sessionId": "session-one",
             "apiKeyId": "key-one",
             "userId": "user-one",
-            "userType": "SUBJECT",
             "expiresAt": null,
             "revalidateAt": "2026-07-28T12:00:00Z"
         })
@@ -298,7 +295,6 @@ mod tests {
         assert_eq!(response.session_id.as_deref(), Some("session-one"));
         assert_eq!(response.api_key_id.as_deref(), Some("key-one"));
         assert_eq!(response.user_id, "user-one");
-        assert_eq!(response.user_type, "SUBJECT");
         assert_eq!(response.expires_at, None);
         assert_eq!(response.revalidate_at, "2026-07-28T12:00:00Z");
         assert_request(request, "/validate");
