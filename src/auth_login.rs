@@ -25,6 +25,11 @@ const CALLBACK_PATH: &str = "/oauth/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const AUTH_URL_PROMPT: &str = "Open this URL to authenticate Disc CLI:";
+const DEVICE_USER_CODE_LABEL: &str = "User code";
+const LOGIN_CANCELLED_MESSAGE: &str = "Disc CLI login cancelled.";
+const DEVICE_EXPIRED_MESSAGE: &str = "Device authorization expired.";
+const DEVICE_DENIED_MESSAGE: &str = "Device authorization was denied.";
 
 #[derive(Debug, Clone, Deserialize)]
 struct ProviderMetadata {
@@ -419,7 +424,7 @@ async fn login_with_pkce(
     no_browser: bool,
 ) -> Result<TokenSet> {
     login_with_pkce_using(client, metadata, client_id, |authorization_url| {
-        println!("Open this URL to authenticate Disc CLI:\n{authorization_url}");
+        println!("{AUTH_URL_PROMPT}\n{authorization_url}");
         if !no_browser && webbrowser::open(authorization_url.as_str()).is_err() {
             eprintln!(
                 "Warning: Could not open a browser automatically. Open the URL above manually."
@@ -464,7 +469,7 @@ where
     on_authorization_url(&authorization_url)?;
     let code = tokio::select! {
         result = wait_for_callback(listener, state.secret()) => result?,
-        _ = tokio::signal::ctrl_c() => bail!("Disc CLI login cancelled."),
+        _ = tokio::signal::ctrl_c() => bail!("{LOGIN_CANCELLED_MESSAGE}"),
     };
     exchange_form(
         client,
@@ -507,11 +512,8 @@ async fn login_with_device(
     let details: DeviceAuthorizationResponse =
         serde_json::from_slice(&read_bounded_response(response).await?)
             .context("Identity provider returned invalid device authorization details.")?;
-    println!(
-        "Open this URL to authenticate Disc CLI:\n{}",
-        details.verification_uri
-    );
-    println!("User code: {}", details.user_code);
+    println!("{AUTH_URL_PROMPT}\n{}", details.verification_uri);
+    println!("{DEVICE_USER_CODE_LABEL}: {}", details.user_code);
     if !no_browser && let Some(url) = &details.verification_uri_complete {
         let _ = webbrowser::open(url);
     }
@@ -519,11 +521,11 @@ async fn login_with_device(
     let mut interval = Duration::from_secs(details.interval.unwrap_or(5).clamp(1, 30));
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => bail!("Disc CLI login cancelled."),
+            _ = tokio::signal::ctrl_c() => bail!("{LOGIN_CANCELLED_MESSAGE}"),
             _ = tokio::time::sleep(interval) => {}
         }
         if Instant::now() >= deadline {
-            bail!("Device authorization expired.");
+            bail!("{DEVICE_EXPIRED_MESSAGE}");
         }
         let response = client
             .post(&metadata.token_endpoint)
@@ -558,8 +560,8 @@ fn device_poll_action(error: &str, interval: Duration) -> Result<DevicePollActio
         "slow_down" => Ok(DevicePollAction::Continue(
             (interval + Duration::from_secs(5)).min(Duration::from_secs(30)),
         )),
-        "access_denied" => bail!("Device authorization was denied."),
-        "expired_token" => bail!("Device authorization expired."),
+        "access_denied" => bail!("{DEVICE_DENIED_MESSAGE}"),
+        "expired_token" => bail!("{DEVICE_EXPIRED_MESSAGE}"),
         code => bail!(
             "Device authorization failed ({}).",
             safe_oauth_error_code(code)
@@ -921,18 +923,21 @@ async fn logout_with_store(profile: &StoredAuthProfile, store: &dyn CredentialSt
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
     use reqwest::Url;
     use secrecy::ExposeSecret;
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        DevicePollAction, LoginOptions, RawTokenResponse, SessionSubject, choose_subject,
-        create_subject_context, device_poll_action, discover, eligible_subjects, exchange_form,
-        http_client, login_with_device, login_with_pkce_using, login_with_store, logout_with_store,
+        AUTH_URL_PROMPT, CALLBACK_PATH, DEVICE_DENIED_MESSAGE, DEVICE_EXPIRED_MESSAGE,
+        DEVICE_USER_CODE_LABEL, DevicePollAction, LOGIN_CANCELLED_MESSAGE, LoginOptions,
+        RawTokenResponse, SessionSubject, callback_page, choose_subject, create_subject_context,
+        device_poll_action, discover, eligible_subjects, exchange_form, http_client,
+        login_with_device, login_with_pkce_using, login_with_store, logout_with_store,
         match_requested_subject, parse_callback_target, profile_name, read_bounded_response,
         refresh_with_store, runtime_oauth_with_store, safe_oauth_error_code, validate_api_base_url,
         validate_token_response, wait_for_callback,
@@ -1003,6 +1008,70 @@ mod tests {
             request
         });
         (origin, handle)
+    }
+
+    fn auth_artifact_inventory() -> String {
+        let assets = BTreeMap::from([
+            (
+                "callback/cancelled.html",
+                callback_page(false).into_bytes(),
+            ),
+            ("callback/style.css", include_bytes!("oauth_callback.css").to_vec()),
+            ("callback/success.html", callback_page(true).into_bytes()),
+            ("loopback/callback-path.txt", CALLBACK_PATH.as_bytes().to_vec()),
+            (
+                "device/presentation.txt",
+                format!(
+                    "{AUTH_URL_PROMPT}\n{DEVICE_USER_CODE_LABEL}: <user-code>\n{LOGIN_CANCELLED_MESSAGE}\n{DEVICE_EXPIRED_MESSAGE}\n{DEVICE_DENIED_MESSAGE}\n"
+                )
+                .into_bytes(),
+            ),
+        ]);
+        let inventory: Vec<_> = assets
+            .into_iter()
+            .map(|(path, contents)| {
+                serde_json::json!({
+                    "length": contents.len(),
+                    "path": path,
+                    "sha256": format!("{:x}", Sha256::digest(&contents)),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&inventory).expect("serialize auth inventory")
+    }
+
+    #[test]
+    fn authentication_asset_inventory_is_stable() {
+        assert_eq!(
+            auth_artifact_inventory(),
+            r#"[
+  {
+    "length": 5393,
+    "path": "callback/cancelled.html",
+    "sha256": "76d0757d37f09bc18033160d62a7d87906ee25356ba26f7192f42eac53169375"
+  },
+  {
+    "length": 4475,
+    "path": "callback/style.css",
+    "sha256": "3c1e7b6976c75b58185d2fef5ba23ff03f5a6d99260f3a0538fda685bb8fd824"
+  },
+  {
+    "length": 5378,
+    "path": "callback/success.html",
+    "sha256": "7f8675d8742eb04a4394eaf693e917610f34c0f742ad866fdc91efb98f3d1caf"
+  },
+  {
+    "length": 152,
+    "path": "device/presentation.txt",
+    "sha256": "5100566e0d6efaddfb171e618cff19f9943ed459a04f88cc854a3f62c2d35206"
+  },
+  {
+    "length": 15,
+    "path": "loopback/callback-path.txt",
+    "sha256": "1c7cbb2f32a02790e0b31e1afea47ca5e87dfab5599d24382f93fd8194e63846"
+  }
+]"#,
+        );
     }
 
     #[test]

@@ -45,7 +45,8 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
 
     - name: Build release binary
-      run: cargo build --locked --release --bin disc
+      shell: bash
+      run: ./scripts/build-release.sh
 
     - name: Package release archive
       shell: bash

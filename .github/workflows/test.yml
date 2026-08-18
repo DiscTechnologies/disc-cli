@@ -25,7 +25,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Verify behavioural coverage
         run: make test-cov
+      - name: Verify deterministic release artifacts
+        run: python3 -m unittest scripts/test_release_artifacts.py
       - name: Verify locked release build
-        run: cargo build --release --locked
+        shell: bash
+        run: ./scripts/build-release.sh
       - name: Audit locked dependencies
         run: cargo audit --deny warnings

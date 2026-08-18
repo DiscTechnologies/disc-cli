@@ -4,3 +4,5 @@
 /disc-signals.ndjson
 /.env.local
 /.env.prod
+__pycache__/
+*.pyc
